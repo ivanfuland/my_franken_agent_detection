@@ -127,8 +127,12 @@ impl CodexConnector {
 
     fn is_token_usage_target_message(message: &NormalizedMessage) -> bool {
         // Attribute token_count usage to concrete assistant turns only.
-        // This avoids attaching usage to synthetic reasoning helper messages.
-        message.role == "assistant" && message.author.is_none()
+        // This used to also require `author.is_none()` to exclude reasoning
+        // messages, which were previously masquerading as `role="assistant"`
+        // with `author=Some("reasoning")`. Now that reasoning has its own
+        // `role="reasoning"` (task 1.3), checking `role` alone is sufficient
+        // and correct even when a real model author is attached.
+        message.role == "assistant"
     }
 
     fn token_usage_from_payload(payload: &Value) -> Option<Value> {
@@ -380,6 +384,42 @@ fn tool_output_text(payload: &Value) -> String {
     flatten_content(output)
 }
 
+/// Render a tool call's own content for display: `<name>(<args JSON>)`, or
+/// just `<name>` when there's no input. Mirrors `claude_code.rs`'s
+/// `render_tool_call_content` -- the full untruncated arguments always live
+/// in `extra["tool_call_args"]`/the invocation's `arguments` for exact
+/// reconstruction (never truncated -- spec §3.2).
+fn render_tool_call_content(name: &str, arguments: Option<&Value>) -> String {
+    match arguments {
+        Some(value) if !value.is_null() => format!("{name}({value})"),
+        _ => name.to_string(),
+    }
+}
+
+/// Extract plaintext reasoning text from a `response_item`/`reasoning`
+/// payload's `summary` array (`[{"type":"summary_text","text":"..."}]`).
+/// Returns empty when `summary` is absent/empty -- e.g. when the item is
+/// fully encrypted with no plaintext summary. Never touches
+/// `encrypted_content` (spec: do not attempt to decrypt it).
+fn reasoning_summary_text(payload: &Value) -> String {
+    let Some(items) = payload.get("summary").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for item in items {
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            if text.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text);
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_lines)]
 fn scan_codex_with_callback(
     ctx: &ScanContext,
@@ -456,6 +496,12 @@ fn scan_codex_with_callback(
             let mut started_at = None;
             let mut ended_at = None;
             let mut session_cwd: Option<PathBuf> = None;
+            // Model provenance for `author` on assistant/tool_call/reasoning
+            // messages (spec: author = model name for those roles). Real
+            // rollouts only ever carry `model` on `turn_context` payloads
+            // (never on `session_meta` or individual `message` items), so
+            // track the most recently seen one as turns progress.
+            let mut current_model: Option<String> = None;
 
             if ext == Some("jsonl") {
                 let f = std::fs::File::open(&file)
@@ -486,6 +532,14 @@ fn scan_codex_with_callback(
                             }
                             update_time_bounds(&mut started_at, &mut ended_at, created);
                         }
+                        "turn_context" => {
+                            if let Some(payload) = val.get("payload") {
+                                if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
+                                    current_model = Some(model.to_string());
+                                }
+                            }
+                            update_time_bounds(&mut started_at, &mut ended_at, created);
+                        }
                         "response_item" => {
                             if let Some(payload) = val.get("payload") {
                                 let payload_type = payload.get("type").and_then(|v| v.as_str());
@@ -512,19 +566,41 @@ fn scan_codex_with_callback(
                                             .and_then(|v| v.as_str())
                                             .map(String::from);
 
-                                        let content_text = format!("[Tool: {tool_name}]");
+                                        // Emitted as its own `tool_call` message
+                                        // (never inlined into an assistant
+                                        // message) -- pairing with its
+                                        // `tool_result` is via
+                                        // `extra["tool_call_id"]`, never
+                                        // content order (spec P-原则-3).
+                                        let content_text = render_tool_call_content(
+                                            &tool_name,
+                                            arguments.as_ref(),
+                                        );
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        let mut extra = if compact_message_extra {
+                                            CodexConnector::compact_message_extra(&val)
+                                        } else {
+                                            val
+                                        };
+                                        if let Value::Object(map) = &mut extra {
+                                            if let Some(ref id) = call_id {
+                                                map.insert(
+                                                    "tool_call_id".to_string(),
+                                                    Value::String(id.clone()),
+                                                );
+                                            }
+                                            map.insert(
+                                                "tool_call_args".to_string(),
+                                                arguments.clone().unwrap_or(Value::Null),
+                                            );
+                                        }
                                         messages.push(NormalizedMessage {
                                             idx: 0,
-                                            role: "assistant".to_string(),
-                                            author: None,
+                                            role: "tool_call".to_string(),
+                                            author: current_model.clone(),
                                             created_at: created,
                                             content: content_text,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
+                                            extra,
                                             invocations: vec![NormalizedInvocation {
                                                 kind: "tool".to_string(),
                                                 name: tool_name,
@@ -537,20 +613,66 @@ fn scan_codex_with_callback(
                                     }
                                     // Tool results: `output` carries the captured
                                     // stdout / patch summary. Emit as a
-                                    // first-class `tool` timeline entry; the
-                                    // linking `call_id` is preserved in `extra`.
+                                    // first-class `tool_result` timeline entry
+                                    // (P0 fix -- this used to be role `tool`,
+                                    // which the downstream adapter mistook for
+                                    // a tool *call* and collapsed to
+                                    // `[tool call]`); the linking `call_id` is
+                                    // preserved in `extra["tool_call_id"]`.
                                     Some("function_call_output" | "custom_tool_call_output") => {
                                         let output_text = tool_output_text(payload);
                                         if output_text.trim().is_empty() {
                                             continue;
                                         }
+                                        let call_id = payload
+                                            .get("call_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        let mut extra = if compact_message_extra {
+                                            CodexConnector::compact_message_extra(&val)
+                                        } else {
+                                            val
+                                        };
+                                        if let Value::Object(map) = &mut extra {
+                                            if let Some(ref id) = call_id {
+                                                map.insert(
+                                                    "tool_call_id".to_string(),
+                                                    Value::String(id.clone()),
+                                                );
+                                            }
+                                        }
                                         messages.push(NormalizedMessage {
                                             idx: 0,
-                                            role: "tool".to_string(),
+                                            role: "tool_result".to_string(),
                                             author: None,
                                             created_at: created,
                                             content: output_text,
+                                            extra,
+                                            invocations: Vec::new(),
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                    // Plaintext reasoning: `summary` carries
+                                    // human-readable text (when present);
+                                    // `encrypted_content` is opaque and never
+                                    // decrypted. Role is `reasoning` (not
+                                    // `assistant`) with `author` = the model
+                                    // that produced it (P-原则-2 fix -- this
+                                    // used to be mislabeled `author="reasoning"`
+                                    // when it appeared at all).
+                                    Some("reasoning") => {
+                                        let text = reasoning_summary_text(payload);
+                                        if text.trim().is_empty() {
+                                            continue;
+                                        }
+                                        update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "reasoning".to_string(),
+                                            author: current_model.clone(),
+                                            created_at: created,
+                                            content: text,
                                             extra: if compact_message_extra {
                                                 CodexConnector::compact_message_extra(&val)
                                             } else {
@@ -562,15 +684,21 @@ fn scan_codex_with_callback(
                                     }
                                     // Plain messages: assistant `output_text`,
                                     // user/developer `input_text`, or legacy
-                                    // string content. Encrypted `reasoning`
-                                    // items have no plaintext content and are
-                                    // intentionally skipped here (plaintext
-                                    // reasoning arrives via `event_msg`).
+                                    // string content.
                                     _ => {
-                                        let role = payload
+                                        let raw_role = payload
                                             .get("role")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("agent");
+                                        // `developer` -> `system` (rename); all
+                                        // other roles (user/assistant/the
+                                        // unreachable-in-practice default) pass
+                                        // through unchanged.
+                                        let role = if raw_role == "developer" {
+                                            "system"
+                                        } else {
+                                            raw_role
+                                        };
 
                                         let content_str = payload
                                             .get("content")
@@ -590,7 +718,11 @@ fn scan_codex_with_callback(
                                         messages.push(NormalizedMessage {
                                             idx: 0,
                                             role: role.to_string(),
-                                            author: None,
+                                            author: if role == "assistant" {
+                                                current_model.clone()
+                                            } else {
+                                                None
+                                            },
                                             created_at: created,
                                             content: content_str,
                                             extra: if compact_message_extra {
@@ -638,6 +770,13 @@ fn scan_codex_with_callback(
                                         }
                                     }
                                     Some("agent_reasoning") => {
+                                        // Legacy plaintext-reasoning event
+                                        // (modern rollouts carry this via
+                                        // `response_item`/`reasoning` instead
+                                        // -- see above). Role is `reasoning`
+                                        // with `author` = model, not the old
+                                        // `role="assistant"`/
+                                        // `author="reasoning"` mislabeling.
                                         let text = payload
                                             .get("text")
                                             .and_then(|v| v.as_str())
@@ -650,8 +789,8 @@ fn scan_codex_with_callback(
                                             );
                                             messages.push(NormalizedMessage {
                                                 idx: 0,
-                                                role: "assistant".to_string(),
-                                                author: Some("reasoning".to_string()),
+                                                role: "reasoning".to_string(),
+                                                author: current_model.clone(),
                                                 created_at: created,
                                                 content: text.to_string(),
                                                 extra: if compact_message_extra {
@@ -665,8 +804,12 @@ fn scan_codex_with_callback(
                                         }
                                     }
                                     Some("tool_call") => {
-                                        // Codex event_msg/tool_call events carry structured
-                                        // tool data that should produce invocations.
+                                        // Codex event_msg/tool_call events carry
+                                        // structured tool data. Like the modern
+                                        // `function_call` response_item, this is
+                                        // emitted as its own `tool_call` message
+                                        // rather than inlined into an assistant
+                                        // message.
                                         let tool_name = payload
                                             .get("name")
                                             .and_then(|v| v.as_str())
@@ -682,19 +825,35 @@ fn scan_codex_with_callback(
                                             .and_then(|v| v.as_str())
                                             .map(String::from);
 
-                                        let content_text = format!("[Tool: {tool_name}]");
+                                        let content_text = render_tool_call_content(
+                                            &tool_name,
+                                            arguments.as_ref(),
+                                        );
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        let mut extra = if compact_message_extra {
+                                            CodexConnector::compact_message_extra(&val)
+                                        } else {
+                                            val
+                                        };
+                                        if let Value::Object(map) = &mut extra {
+                                            if let Some(ref id) = call_id {
+                                                map.insert(
+                                                    "tool_call_id".to_string(),
+                                                    Value::String(id.clone()),
+                                                );
+                                            }
+                                            map.insert(
+                                                "tool_call_args".to_string(),
+                                                arguments.clone().unwrap_or(Value::Null),
+                                            );
+                                        }
                                         messages.push(NormalizedMessage {
                                             idx: 0,
-                                            role: "assistant".to_string(),
-                                            author: None,
+                                            role: "tool_call".to_string(),
+                                            author: current_model.clone(),
                                             created_at: created,
                                             content: content_text,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
+                                            extra,
                                             invocations: vec![NormalizedInvocation {
                                                 kind: "tool".to_string(),
                                                 name: tool_name,
@@ -1093,12 +1252,15 @@ mod tests {
             .expect("assistant output_text message captured");
         assert!(assistant.invocations.is_empty());
 
-        // `function_call` -> tool invocation with JSON-string arguments parsed.
+        // `function_call` -> its own `tool_call` message (not inlined into
+        // assistant), with JSON-string arguments parsed and linkable via
+        // `extra["tool_call_id"]`.
         let exec = conv
             .messages
             .iter()
             .find(|m| m.invocations.iter().any(|i| i.name == "exec_command"))
             .expect("exec_command function_call captured");
+        assert_eq!(exec.role, "tool_call");
         let exec_inv = &exec.invocations[0];
         assert_eq!(exec_inv.kind, "tool");
         assert_eq!(exec_inv.call_id.as_deref(), Some("call_1"));
@@ -1111,28 +1273,34 @@ mod tests {
             Some("ls"),
             "JSON-string arguments are decoded into structured JSON"
         );
+        assert_eq!(exec.extra["tool_call_id"].as_str(), Some("call_1"));
 
-        // `function_call_output` -> tool result, linkable via call_id in extra.
+        // `function_call_output` -> `tool_result` (P0 rename from `tool`,
+        // which the downstream adapter mistook for a tool call), linkable via
+        // `extra["tool_call_id"]` -- the same key/value as its `tool_call`.
         let exec_out = conv
             .messages
             .iter()
-            .find(|m| m.role == "tool" && m.content.contains("README.md"))
-            .expect("function_call_output captured as tool result");
+            .find(|m| m.role == "tool_result" && m.content.contains("README.md"))
+            .expect("function_call_output captured as tool_result");
         assert_eq!(
-            exec_out
-                .extra
-                .pointer("/payload/call_id")
-                .and_then(|v| v.as_str()),
+            exec_out.extra["tool_call_id"].as_str(),
             Some("call_1"),
-            "tool result remains linkable to its originating call"
+            "tool_result remains linkable to its originating tool_call via extra[\"tool_call_id\"]"
+        );
+        assert_eq!(
+            exec_out.extra["tool_call_id"], exec.extra["tool_call_id"],
+            "tool_call and tool_result pair on the same tool_call_id"
         );
 
-        // `custom_tool_call` (apply_patch) -> tool invocation; freeform input kept.
+        // `custom_tool_call` (apply_patch) -> its own `tool_call` message;
+        // freeform input kept.
         let patch = conv
             .messages
             .iter()
             .find(|m| m.invocations.iter().any(|i| i.name == "apply_patch"))
             .expect("apply_patch custom_tool_call captured");
+        assert_eq!(patch.role, "tool_call");
         let patch_inv = &patch.invocations[0];
         assert_eq!(patch_inv.call_id.as_deref(), Some("call_2"));
         assert!(
@@ -1144,12 +1312,146 @@ mod tests {
             "non-JSON tool input is retained as a raw string"
         );
 
-        // `custom_tool_call_output` -> tool result message.
+        // `custom_tool_call_output` -> `tool_result` message.
         assert!(
             conv.messages
                 .iter()
-                .any(|m| m.role == "tool" && m.content.contains("A hello.txt")),
-            "custom_tool_call_output captured as tool result"
+                .any(|m| m.role == "tool_result" && m.content.contains("A hello.txt")),
+            "custom_tool_call_output captured as tool_result"
+        );
+
+        // No message uses a pre-6-role name.
+        assert!(
+            conv.messages
+                .iter()
+                .all(|m| !matches!(m.role.as_str(), "agent" | "tool" | "developer")),
+            "roles: {:?}",
+            conv.messages.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+    }
+
+    // =========================================================================
+    // 6-role normalization tests (franken fork, spec §3.3 codex)
+    // =========================================================================
+
+    #[test]
+    fn scan_codex_normalizes_to_six_role_messages() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Real Codex rollout shapes (verified against ~/.codex/sessions/**/*.jsonl):
+        // turn_context carries `model`; developer/user/assistant `message`
+        // items; a `reasoning` item with plaintext `summary`; a paired
+        // `function_call`/`function_call_output`.
+        let content = concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/codex-demo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex, a coding agent."}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"List the files in this repo."}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"I should run ls to see what's here."}],"encrypted_content":"gAAAAA-opaque"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"ls -la\",\"workdir\":\"/tmp/codex-demo\"}","call_id":"call_1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"total 8\ndrwxr-xr-x  2 user user 4096 Jan  1 00:00 .\n-rw-r--r--  1 user user   12 Jan  1 00:00 README.md\n"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:07Z","type":"response_item","payload":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"I found README.md in the directory."}]}}"#,
+            "\n",
+        );
+        fs::write(sessions.join("rollout-six-role.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+
+        // developer -> system (rename).
+        let system = conv
+            .messages
+            .iter()
+            .find(|m| m.content == "You are Codex, a coding agent.")
+            .expect("developer message captured");
+        assert_eq!(system.role, "system");
+
+        // function_call -> its own tool_call message, args non-empty.
+        let tool_call = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call")
+            .expect("tool_call message");
+        assert!(
+            tool_call.invocations[0].arguments.is_some(),
+            "tool_call must carry non-empty args from function_call.arguments"
+        );
+        assert_eq!(
+            tool_call.invocations[0]
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("cmd"))
+                .and_then(|v| v.as_str()),
+            Some("ls -la")
+        );
+        let tool_call_id = tool_call
+            .extra
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .expect("tool_call extra[\"tool_call_id\"] must be set");
+        assert_eq!(tool_call_id, "call_1");
+
+        // function_call_output -> role tool_result (P0 rename from "tool"),
+        // full untruncated output, paired to the tool_call via tool_call_id.
+        let tool_result = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("tool_result message");
+        assert_eq!(
+            tool_result.content,
+            "total 8\ndrwxr-xr-x  2 user user 4096 Jan  1 00:00 .\n-rw-r--r--  1 user user   12 Jan  1 00:00 README.md\n",
+            "tool_result content must be the FULL output, never truncated/replaced with [tool call]"
+        );
+        assert_eq!(
+            tool_result
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some(tool_call_id),
+            "tool_result pairs to its tool_call via extra[\"tool_call_id\"], not content order"
+        );
+
+        // reasoning -> role reasoning, author is the real model (not the
+        // literal string "reasoning", and not empty since the model is known).
+        let reasoning = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("reasoning message");
+        assert_eq!(reasoning.content, "I should run ls to see what's here.");
+        assert_ne!(reasoning.author.as_deref(), Some("reasoning"));
+        assert_eq!(reasoning.author.as_deref(), Some("gpt-5.5"));
+
+        // No message anywhere uses a pre-6-role name.
+        assert!(
+            conv.messages
+                .iter()
+                .all(|m| !matches!(m.role.as_str(), "agent" | "tool" | "developer")),
+            "roles: {:?}",
+            conv.messages.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+
+        // idx must be contiguous 0..N.
+        assert!(
+            conv.messages
+                .iter()
+                .enumerate()
+                .all(|(i, m)| m.idx as usize == i)
         );
     }
 
@@ -1387,7 +1689,11 @@ mod tests {
         let sessions = codex_dir.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
 
-        let content = r#"{"type":"event_msg","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"agent_reasoning","text":"Let me think about this..."}}
+        // `turn_context.model` precedes the reasoning event, like real
+        // rollouts, so `author` reflects the real model instead of the old
+        // literal `"reasoning"` mislabeling.
+        let content = r#"{"type":"turn_context","timestamp":"2025-12-01T09:59:59Z","payload":{"model":"gpt-5.5"}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"agent_reasoning","text":"Let me think about this..."}}
 "#;
         fs::write(sessions.join("rollout-reasoning.jsonl"), content).unwrap();
 
@@ -1397,8 +1703,8 @@ mod tests {
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
-        assert_eq!(convs[0].messages[0].role, "assistant");
-        assert_eq!(convs[0].messages[0].author, Some("reasoning".to_string()));
+        assert_eq!(convs[0].messages[0].role, "reasoning");
+        assert_eq!(convs[0].messages[0].author, Some("gpt-5.5".to_string()));
         assert_eq!(convs[0].messages[0].content, "Let me think about this...");
         assert!(convs[0].started_at.is_some());
         assert!(convs[0].ended_at.is_some());
@@ -2558,13 +2864,19 @@ not valid json at all
         // user_message + tool_call events should produce messages
         assert_eq!(convs[0].messages.len(), 2);
 
-        // tool_call event should produce an assistant message with invocation
+        // tool_call event should produce its own `tool_call` message (not
+        // inlined into `assistant`), with invocation args intact.
         let tool_msg = &convs[0].messages[0];
-        assert_eq!(tool_msg.role, "assistant");
+        assert_eq!(tool_msg.role, "tool_call");
         assert_eq!(tool_msg.invocations.len(), 1);
         assert_eq!(tool_msg.invocations[0].kind, "tool");
         assert_eq!(tool_msg.invocations[0].name, "bash");
         assert!(tool_msg.invocations[0].arguments.is_some());
+        assert!(
+            tool_msg.content.contains("bash"),
+            "content should render the tool name + args, not a bare marker: {}",
+            tool_msg.content
+        );
 
         // user_message event should still produce a user message
         let user_msg = &convs[0].messages[1];
