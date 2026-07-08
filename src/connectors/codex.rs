@@ -420,6 +420,36 @@ fn reasoning_summary_text(payload: &Value) -> String {
     out
 }
 
+/// Guarantee the opaque `encrypted_content` blob (the only thing worth
+/// preserving on an otherwise-empty, encrypted-only reasoning item) survives
+/// in the emitted message's `extra` on BOTH the compact and non-compact
+/// paths.
+///
+/// The non-compact path stores the whole line as `extra` (blob reachable at
+/// `/payload/encrypted_content`), so nothing is added. The compact path
+/// (`compact_message_extra`) strips everything except `cass` metadata, so the
+/// blob is re-attached at the top level. It is only inserted when not already
+/// reachable, so the non-compact path never grows a duplicate.
+///
+/// `encrypted_content` is NEVER decrypted -- it is preserved verbatim.
+///
+/// `encrypted_content` is passed pre-extracted (owned/borrowed independently of
+/// the source line) because the caller has already moved the raw line into
+/// `extra` by the time this runs.
+fn preserve_encrypted_content(extra: &mut Value, encrypted_content: Option<&Value>) {
+    let Some(enc) = encrypted_content else {
+        return;
+    };
+    let already_present = extra.pointer("/payload/encrypted_content").is_some()
+        || extra.get("encrypted_content").is_some();
+    if already_present {
+        return;
+    }
+    if let Value::Object(map) = extra {
+        map.insert("encrypted_content".to_string(), enc.clone());
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn scan_codex_with_callback(
     ctx: &ScanContext,
@@ -619,11 +649,15 @@ fn scan_codex_with_callback(
                                     // a tool *call* and collapsed to
                                     // `[tool call]`); the linking `call_id` is
                                     // preserved in `extra["tool_call_id"]`.
+                                    // Completeness policy (uniform with
+                                    // claude_code.rs): NEVER drop a structural
+                                    // item for empty content -- a command that
+                                    // succeeds with no stdout produces a
+                                    // legitimate empty `tool_result`; dropping
+                                    // it would break the tool_call<->tool_result
+                                    // pairing chain.
                                     Some("function_call_output" | "custom_tool_call_output") => {
                                         let output_text = tool_output_text(payload);
-                                        if output_text.trim().is_empty() {
-                                            continue;
-                                        }
                                         let call_id = payload
                                             .get("call_id")
                                             .and_then(|v| v.as_str())
@@ -653,31 +687,50 @@ fn scan_codex_with_callback(
                                             snippets: Vec::new(),
                                         });
                                     }
-                                    // Plaintext reasoning: `summary` carries
-                                    // human-readable text (when present);
-                                    // `encrypted_content` is opaque and never
-                                    // decrypted. Role is `reasoning` (not
-                                    // `assistant`) with `author` = the model
-                                    // that produced it (P-原则-2 fix -- this
-                                    // used to be mislabeled `author="reasoning"`
-                                    // when it appeared at all).
+                                    // Reasoning: `summary` carries plaintext
+                                    // (when present); `encrypted_content` is
+                                    // opaque and NEVER decrypted. Role is
+                                    // `reasoning` (not `assistant`) with
+                                    // `author` = the model that produced it
+                                    // (P-原则-2 fix -- this used to be
+                                    // mislabeled `author="reasoning"`).
+                                    // Completeness policy (uniform with
+                                    // claude_code.rs): NEVER drop a structural
+                                    // item for empty content. ~99.99% of real
+                                    // codex reasoning items are encrypted-only
+                                    // (empty `summary`, opaque
+                                    // `encrypted_content`); emit them as empty
+                                    // structural reasoning messages, preserving
+                                    // `encrypted_content` in `extra` for
+                                    // hypothetical future decryption.
                                     Some("reasoning") => {
                                         let text = reasoning_summary_text(payload);
-                                        if text.trim().is_empty() {
-                                            continue;
-                                        }
+                                        // Capture the opaque blob before `val`
+                                        // is moved into `extra` (payload borrows
+                                        // val).
+                                        let encrypted_content =
+                                            payload.get("encrypted_content").cloned();
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        let mut extra = if compact_message_extra {
+                                            CodexConnector::compact_message_extra(&val)
+                                        } else {
+                                            val
+                                        };
+                                        // Guarantee the opaque `encrypted_content`
+                                        // blob survives in `extra` on BOTH the
+                                        // compact and non-compact paths (see
+                                        // `preserve_encrypted_content`).
+                                        preserve_encrypted_content(
+                                            &mut extra,
+                                            encrypted_content.as_ref(),
+                                        );
                                         messages.push(NormalizedMessage {
                                             idx: 0,
                                             role: "reasoning".to_string(),
                                             author: current_model.clone(),
                                             created_at: created,
                                             content: text,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
+                                            extra,
                                             invocations: Vec::new(),
                                             snippets: Vec::new(),
                                         });
@@ -1235,16 +1288,38 @@ mod tests {
         assert_eq!(conv.workspace, Some(PathBuf::from("/tmp/demo-project")));
 
         // user, assistant output_text, function_call, function_call_output,
-        // custom_tool_call, custom_tool_call_output = 6 messages. The encrypted
-        // reasoning item carries no plaintext content and is skipped.
+        // custom_tool_call, custom_tool_call_output, reasoning = 7 messages.
+        // The encrypted-only reasoning item is now EMITTED as an empty
+        // structural reasoning message (completeness policy), not skipped --
+        // its `encrypted_content` is preserved in `extra`.
         assert_eq!(
             conv.messages.len(),
-            6,
-            "all modern shapes captured (encrypted reasoning skipped): {:#?}",
+            7,
+            "all modern shapes captured (encrypted reasoning emitted): {:#?}",
             conv.messages
                 .iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect::<Vec<_>>()
+        );
+
+        // Encrypted-only reasoning: emitted with empty content, role
+        // `reasoning`, and its opaque `encrypted_content` preserved in extra.
+        let reasoning = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("encrypted-only reasoning item is emitted, not dropped");
+        assert!(
+            reasoning.content.is_empty(),
+            "encrypted-only reasoning has no plaintext content"
+        );
+        assert_eq!(
+            reasoning
+                .extra
+                .pointer("/payload/encrypted_content")
+                .and_then(|v| v.as_str()),
+            Some("gAAAAA-opaque-no-plaintext"),
+            "encrypted_content blob must be preserved in the reasoning message's extra"
         );
 
         // Assistant `output_text` is no longer dropped.
@@ -1459,6 +1534,131 @@ mod tests {
                 .enumerate()
                 .all(|(i, m)| m.idx as usize == i)
         );
+    }
+
+    #[test]
+    fn scan_emits_empty_tool_result_and_preserves_pairing() {
+        // Completeness policy (uniform with claude_code.rs): a command that
+        // succeeds with no stdout produces a legitimate EMPTY tool_result --
+        // it must still be emitted (not dropped), so the tool_call<->tool_result
+        // pairing chain via `extra["tool_call_id"]` survives.
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"true\"}","call_id":"call_empty"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"type":"function_call_output","call_id":"call_empty","output":""}}
+"#;
+        fs::write(sessions.join("rollout-empty-output.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let tool_result = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("empty function_call_output must still be emitted as a tool_result");
+        assert_eq!(
+            tool_result.content, "",
+            "empty output stays empty, not dropped"
+        );
+        assert_eq!(
+            tool_result
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some("call_empty"),
+            "pairing to the tool_call must survive even with empty output"
+        );
+    }
+
+    #[test]
+    fn scan_emits_encrypted_only_reasoning_and_preserves_blob() {
+        // Completeness policy: ~99.99% of real codex reasoning items are
+        // encrypted-only (empty `summary`, opaque `encrypted_content`). They
+        // must be emitted as empty structural reasoning messages, preserving
+        // `encrypted_content` in `extra` (never decrypted).
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"turn_context","timestamp":"2025-12-01T09:59:59Z","payload":{"model":"gpt-5.5"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAAAA-secret-blob"}}
+"#;
+        fs::write(sessions.join("rollout-encrypted-reasoning.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let reasoning = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("encrypted-only reasoning must still be emitted, not dropped");
+        assert!(
+            reasoning.content.is_empty(),
+            "encrypted-only reasoning has empty content"
+        );
+        assert_eq!(reasoning.author.as_deref(), Some("gpt-5.5"));
+        // Non-compact path: the whole payload is carried, so the blob is
+        // reachable under /payload.
+        assert_eq!(
+            reasoning
+                .extra
+                .pointer("/payload/encrypted_content")
+                .and_then(|v| v.as_str()),
+            Some("gAAAAA-secret-blob"),
+            "encrypted_content must survive in the reasoning message's extra"
+        );
+    }
+
+    #[test]
+    fn preserve_encrypted_content_covers_compact_and_noncompact_paths() {
+        // Compact path: `compact_message_extra` has already stripped
+        // everything except cass metadata -> the blob must be re-attached at
+        // the top level so it survives compaction.
+        let payload = json!({
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "gAAAAA-blob"
+        });
+        let mut compacted = json!({"cass": {"model": "gpt-5.5"}});
+        preserve_encrypted_content(&mut compacted, payload.get("encrypted_content"));
+        assert_eq!(
+            compacted.get("encrypted_content").and_then(|v| v.as_str()),
+            Some("gAAAAA-blob"),
+            "compact path must re-attach the stripped encrypted_content"
+        );
+
+        // Non-compact path: the blob is already reachable under /payload ->
+        // no top-level duplicate is added.
+        let mut full = json!({
+            "type": "response_item",
+            "payload": {"type": "reasoning", "encrypted_content": "gAAAAA-blob"}
+        });
+        preserve_encrypted_content(&mut full, payload.get("encrypted_content"));
+        assert!(
+            full.get("encrypted_content").is_none(),
+            "non-compact path must not grow a top-level duplicate"
+        );
+        assert_eq!(
+            full.pointer("/payload/encrypted_content")
+                .and_then(|v| v.as_str()),
+            Some("gAAAAA-blob")
+        );
+
+        // No `encrypted_content` in payload -> extra is left untouched.
+        let bare = json!({"type": "reasoning", "summary": []});
+        let mut extra = json!({});
+        preserve_encrypted_content(&mut extra, bare.get("encrypted_content"));
+        assert_eq!(extra, json!({}));
     }
 
     #[test]
