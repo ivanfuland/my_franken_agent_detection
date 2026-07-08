@@ -17,7 +17,9 @@ use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct OpenClawConnector;
 
@@ -293,37 +295,132 @@ impl OpenClawConnector {
         out
     }
 
-    /// Flatten `OpenClaw` content blocks into a single string.
-    /// Content is an array of blocks: text, toolCall, thinking.
-    fn flatten_openclaw_content(content: &Value) -> String {
-        match content {
-            Value::String(s) => s.clone(),
-            Value::Array(arr) => {
-                let parts: Vec<String> = arr
-                    .iter()
-                    .filter_map(|block| {
-                        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match block_type {
-                            "text" => block.get("text").and_then(|t| t.as_str()).map(String::from),
-                            "toolCall" => {
-                                let name = block
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("tool_call");
-                                Some(format!("[tool: {name}]"))
-                            }
-                            "thinking" => {
-                                block.get("text").and_then(|t| t.as_str()).map(String::from)
-                            }
-                            _ => block.get("text").and_then(|t| t.as_str()).map(String::from),
-                        }
-                    })
-                    .collect();
-                parts.join("\n")
-            }
-            _ => flatten_content(content),
+    /// Render a `toolCall` block's own content for display: `<name>(<args
+    /// JSON>)`, or just `<name>` when there's no args. Mirrors
+    /// `claude_code.rs`'s `render_tool_call_content` -- the full untruncated
+    /// args always live in `extra["tool_call_args"]`/the invocation's
+    /// `arguments` for exact reconstruction (never truncated -- spec §3.2).
+    fn render_tool_call_content(name: &str, args: Option<&Value>) -> String {
+        match args {
+            Some(value) if !value.is_null() => format!("{name}({value})"),
+            _ => name.to_string(),
         }
     }
+
+    /// Resolve a `toolResult`'s pairing id from a single JSON object (either
+    /// the top-level `message` or a nested content block): prefer
+    /// `toolCallId`, falling back to `toolUseId`/`tool_use_id`/`id` -- all
+    /// equal to the originating `toolCall`'s id in real `~/.openclaw`
+    /// sessions (spec §3.3 openclaw).
+    fn openclaw_pairing_id_from(v: &Value) -> Option<String> {
+        ["toolCallId", "toolUseId", "tool_use_id", "id"]
+            .iter()
+            .find_map(|key| v.get(*key).and_then(|x| x.as_str()).map(String::from))
+    }
+
+    /// Extract a single content block's own result body: prefers `content`
+    /// (the openclaw `toolResult` block's full body field), falling back to
+    /// `text` (the plainer shape some real `toolResult` messages emit
+    /// instead -- both verified against `~/.openclaw/agents/*/sessions/*.jsonl`).
+    fn openclaw_block_body(block: &Value) -> Option<String> {
+        let body = block.get("content").or_else(|| block.get("text"))?;
+        Some(match body {
+            Value::String(s) => s.clone(),
+            other => flatten_content(other),
+        })
+    }
+
+    /// Extract a `toolResult`'s full untruncated body from the
+    /// message-level `content` value, which is a plain string, or an array
+    /// containing a single block -- typed `toolResult` (many redundant id
+    /// fields, body in `content`/`text`) or, in some real sessions, plain
+    /// `text` (body only in `text`) -- whose own `content`/`text` carries
+    /// the body. Never truncated (spec §3.2).
+    fn openclaw_tool_result_text(content: &Value) -> String {
+        match content {
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(Self::openclaw_block_body)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => flatten_content(other),
+        }
+    }
+
+    /// Split an `OpenClaw` `message.content` array into typed blocks, one per
+    /// element, instead of flattening everything into one string. `OpenClaw`
+    /// uses its own camelCase block vocabulary (`toolCall`/`toolResult`)
+    /// rather than Anthropic's (`tool_use`/`tool_result`), so this doesn't
+    /// reuse `split_content_blocks` (task 1.1) verbatim.
+    fn split_openclaw_blocks(content: &Value) -> Vec<OpenClawBlock> {
+        let Some(arr) = content.as_array() else {
+            return Vec::new();
+        };
+
+        let mut blocks = Vec::new();
+        for block in arr {
+            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match block_type {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        blocks.push(OpenClawBlock::Text(text.to_string()));
+                    }
+                }
+                "toolCall" => {
+                    let name = block
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let args = block
+                        .get("arguments")
+                        .or_else(|| block.get("input"))
+                        .cloned();
+                    let id = block.get("id").and_then(|v| v.as_str()).map(String::from);
+                    blocks.push(OpenClawBlock::ToolCall { name, args, id });
+                }
+                "toolResult" => {
+                    // Defensive: real ~/.openclaw sessions never nest a
+                    // toolResult block inside a non-toolResult-role message
+                    // (toolResult always arrives as its own top-level
+                    // message -- handled separately in `scan`), but the
+                    // spec calls for handling both shapes explicitly.
+                    let id = Self::openclaw_pairing_id_from(block);
+                    let text = Self::openclaw_block_body(block).unwrap_or_default();
+                    blocks.push(OpenClawBlock::ToolResult { text, id });
+                }
+                "thinking" => {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        blocks.push(OpenClawBlock::Thinking(text.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        blocks
+    }
+}
+
+/// A single `OpenClaw` `message.content` array element, split by block type
+/// rather than merged into one flattened string (the typed counterpart to
+/// the old `flatten_openclaw_content`). Full `toolCall` args / `toolResult`
+/// content are always preserved untruncated -- truncation is an
+/// adapter-feed concern, never canonical/franken (spec §3.2).
+enum OpenClawBlock {
+    /// `{"type":"text","text":...}`.
+    Text(String),
+    /// `{"type":"toolCall","name":...,"arguments":...,"input":...,"id":...}`.
+    ToolCall {
+        name: String,
+        args: Option<Value>,
+        id: Option<String>,
+    },
+    /// A `toolResult` block nested in a non-toolResult-role message's
+    /// content array (defensive path; see `split_openclaw_blocks`).
+    ToolResult { text: String, id: Option<String> },
+    /// `{"type":"thinking","text":...}`.
+    Thinking(String),
 }
 
 impl Connector for OpenClawConnector {
@@ -441,19 +538,10 @@ impl Connector for OpenClawConnector {
                                 continue;
                             };
 
-                            let role = msg
+                            let raw_role = msg
                                 .get("role")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("assistant");
-
-                            let content = msg
-                                .get("content")
-                                .map(Self::flatten_openclaw_content)
-                                .unwrap_or_default();
-
-                            if content.trim().is_empty() {
-                                continue;
-                            }
 
                             // Timestamps can be on the wrapper or inner message
                             let created = val
@@ -472,55 +560,220 @@ impl Connector for OpenClawConnector {
                                 (other, None) => other,
                             };
 
-                            let invocations = msg
-                                .get("content")
-                                .and_then(|c| c.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter(|block| {
-                                            block.get("type").and_then(|t| t.as_str())
-                                                == Some("toolCall")
-                                        })
-                                        .map(|block| {
-                                            let name = block
-                                                .get("name")
-                                                .and_then(|n| n.as_str())
-                                                .unwrap_or("unknown")
-                                                .to_string();
-                                            crate::types::NormalizedInvocation {
-                                                kind: "tool".to_string(),
-                                                name,
-                                                raw_name: None,
-                                                call_id: block
-                                                    .get("id")
-                                                    .and_then(|v| v.as_str())
-                                                    .map(String::from),
-                                                arguments: block
-                                                    .get("arguments")
-                                                    .or_else(|| block.get("input"))
-                                                    .cloned(),
-                                            }
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
+                            let author =
+                                msg.get("model").and_then(|v| v.as_str()).map(String::from);
+                            let content = msg.get("content");
+                            let base_extra = val.clone();
 
-                            let idx = i64::try_from(messages.len()).unwrap_or(i64::MAX);
-                            messages.push(NormalizedMessage {
-                                idx,
-                                role: role.to_string(),
-                                author: msg.get("model").and_then(|v| v.as_str()).map(String::from),
-                                created_at: created,
-                                content,
-                                extra: val,
-                                invocations,
-                                snippets: Vec::new(),
-                            });
+                            // Top-level `toolResult` messages (role=="toolResult")
+                            // carry the whole tool result body directly on the
+                            // message -- pairing id lives on the message itself
+                            // (`toolCallId`, falling back to
+                            // `toolUseId`/`tool_use_id`/`id`), body lives in
+                            // `content` (a plain string, or an array with a
+                            // single block -- typed `toolResult`, or in some
+                            // real sessions plain `text` -- both shapes
+                            // verified against real ~/.openclaw sessions).
+                            if raw_role == "toolResult" {
+                                let result_text = content
+                                    .map(Self::openclaw_tool_result_text)
+                                    .unwrap_or_default();
+                                if result_text.trim().is_empty() {
+                                    continue;
+                                }
+                                let pairing_id =
+                                    Self::openclaw_pairing_id_from(msg).or_else(|| {
+                                        content
+                                            .and_then(Value::as_array)
+                                            .and_then(|arr| arr.first())
+                                            .and_then(Self::openclaw_pairing_id_from)
+                                    });
+                                let mut extra = base_extra;
+                                if let (Value::Object(map), Some(id)) = (&mut extra, &pairing_id) {
+                                    map.insert(
+                                        "tool_call_id".to_string(),
+                                        Value::String(id.clone()),
+                                    );
+                                }
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: "tool_result".to_string(),
+                                    author: None,
+                                    created_at: created,
+                                    content: result_text,
+                                    extra,
+                                    invocations: Vec::new(),
+                                    snippets: Vec::new(),
+                                });
+                                continue;
+                            }
+
+                            // user/assistant messages: content is a plain string
+                            // or an array interleaving `text`, `toolCall`,
+                            // `thinking` blocks. Split by type (mirrors
+                            // claude_code.rs/task 1.2) instead of flattening
+                            // everything into one string, so each block becomes
+                            // its own typed 6-role message (spec §3.3) rather
+                            // than an inline `[tool: name]` marker glued into
+                            // prose. OpenClaw's role strings (`user`/`assistant`)
+                            // already match the 6-role vocabulary verbatim --
+                            // no rename needed (unlike codex's developer->system).
+                            let canonical_role = raw_role;
+                            let is_assistant = canonical_role == "assistant";
+
+                            match content {
+                                Some(Value::Array(_)) => {
+                                    let blocks = Self::split_openclaw_blocks(content.unwrap());
+
+                                    let mut prose = String::new();
+                                    for block in &blocks {
+                                        if let OpenClawBlock::Text(text) = block {
+                                            if !prose.is_empty() {
+                                                prose.push('\n');
+                                            }
+                                            prose.push_str(text);
+                                        }
+                                    }
+                                    if !prose.trim().is_empty() {
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: canonical_role.to_string(),
+                                            author: if is_assistant {
+                                                author.clone()
+                                            } else {
+                                                None
+                                            },
+                                            created_at: created,
+                                            content: prose,
+                                            extra: base_extra.clone(),
+                                            invocations: Vec::new(),
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+
+                                    for block in blocks {
+                                        match block {
+                                            OpenClawBlock::Text(_) => {}
+                                            OpenClawBlock::ToolCall { name, args, id } => {
+                                                let content_text = Self::render_tool_call_content(
+                                                    &name,
+                                                    args.as_ref(),
+                                                );
+                                                let mut extra = base_extra.clone();
+                                                if let Value::Object(map) = &mut extra {
+                                                    if let Some(ref call_id) = id {
+                                                        map.insert(
+                                                            "tool_call_id".to_string(),
+                                                            Value::String(call_id.clone()),
+                                                        );
+                                                    }
+                                                    map.insert(
+                                                        "tool_call_args".to_string(),
+                                                        args.clone().unwrap_or(Value::Null),
+                                                    );
+                                                }
+                                                // tool_call/tool_result pairing is
+                                                // via this explicit id
+                                                // (extra["tool_call_id"]), never
+                                                // content order (spec P-原则-3).
+                                                messages.push(NormalizedMessage {
+                                                    idx: 0,
+                                                    role: "tool_call".to_string(),
+                                                    author: author.clone(),
+                                                    created_at: created,
+                                                    content: content_text,
+                                                    extra,
+                                                    invocations: vec![NormalizedInvocation {
+                                                        kind: "tool".to_string(),
+                                                        name,
+                                                        raw_name: None,
+                                                        call_id: id,
+                                                        arguments: args,
+                                                    }],
+                                                    snippets: Vec::new(),
+                                                });
+                                            }
+                                            OpenClawBlock::ToolResult { text, id } => {
+                                                if text.trim().is_empty() {
+                                                    continue;
+                                                }
+                                                let mut extra = base_extra.clone();
+                                                if let (Value::Object(map), Some(call_id)) =
+                                                    (&mut extra, &id)
+                                                {
+                                                    map.insert(
+                                                        "tool_call_id".to_string(),
+                                                        Value::String(call_id.clone()),
+                                                    );
+                                                }
+                                                messages.push(NormalizedMessage {
+                                                    idx: 0,
+                                                    role: "tool_result".to_string(),
+                                                    author: None,
+                                                    created_at: created,
+                                                    content: text,
+                                                    extra,
+                                                    invocations: Vec::new(),
+                                                    snippets: Vec::new(),
+                                                });
+                                            }
+                                            OpenClawBlock::Thinking(text) => {
+                                                messages.push(NormalizedMessage {
+                                                    idx: 0,
+                                                    role: "reasoning".to_string(),
+                                                    author: author.clone(),
+                                                    created_at: created,
+                                                    content: text,
+                                                    extra: base_extra.clone(),
+                                                    invocations: Vec::new(),
+                                                    snippets: Vec::new(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(other) => {
+                                    // Not a content-block array (e.g. a plain
+                                    // string) -- no toolCall/toolResult/thinking
+                                    // blocks are possible here.
+                                    let content_str = flatten_content(other);
+                                    if !content_str.trim().is_empty() {
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: canonical_role.to_string(),
+                                            author: if is_assistant { author } else { None },
+                                            created_at: created,
+                                            content: content_str,
+                                            extra: base_extra,
+                                            invocations: Vec::new(),
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                }
+                                None => {}
+                            }
                         }
                         // Skip model_change, thinking_level_change, custom, etc.
+                        // Verified against real ~/.openclaw sessions (scan of
+                        // ~200 files): `session`/`thinking_level_change`/
+                        // `model_change` carry only metadata (cwd/id,
+                        // thinking-level string, provider/modelId); `custom`
+                        // entries in this fork are all `customType:
+                        // "model-snapshot"` (provider/modelId metadata). None
+                        // carries substantive user-facing content that should
+                        // instead become a `system` message (unlike claude's
+                        // `away_summary`), so dropping them is correct.
                         _ => {}
                     }
                 }
+
+                // Splitting one raw "message" line into several typed messages
+                // (text/toolCall/thinking/toolResult) means idx must be
+                // recomputed to stay contiguous 0..N (spec §3.4) -- required
+                // for `UNIQUE(conversation_id,idx)`. OpenClaw previously never
+                // called this (idx was assigned inline, 1 push per line); now
+                // required.
+                crate::types::reindex_messages(&mut messages);
 
                 if messages.is_empty() {
                     continue;
@@ -653,19 +906,185 @@ mod tests {
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].agent_slug, "openclaw");
-        assert_eq!(convs[0].messages.len(), 2);
+        // 6-role normalization: the assistant's `text` + `toolCall` blocks
+        // split into two messages (prose + tool_call) rather than one
+        // combined message with an inline `[tool: exec]` marker.
+        assert_eq!(convs[0].messages.len(), 3);
         assert_eq!(convs[0].title, Some("Hello OpenClaw".to_string()));
         assert_eq!(convs[0].messages[0].role, "user");
         assert_eq!(convs[0].messages[1].role, "assistant");
         assert!(convs[0].messages[1].content.contains("Hi there!"));
-        assert!(convs[0].messages[1].content.contains("[tool: exec]"));
+        assert!(
+            !convs[0].messages[1].content.contains("[tool:"),
+            "assistant prose must not carry an inline tool marker (spec §3.3): {:?}",
+            convs[0].messages[1].content
+        );
         assert_eq!(
             convs[0].messages[1].author,
             Some("claude-opus-4-5".to_string())
         );
+        let tool_call = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call")
+            .expect("toolCall block must become its own tool_call message");
+        assert!(tool_call.content.contains("exec"));
+        assert_eq!(tool_call.extra["tool_call_id"].as_str(), Some("tc1"));
         assert!(convs[0].workspace.is_some());
         assert!(convs[0].started_at.is_some());
         crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+    }
+
+    // =========================================================================
+    // 6-role normalization tests (franken fork, spec §3.3 openclaw)
+    // =========================================================================
+
+    #[test]
+    fn scan_openclaw_splits_content_blocks_into_typed_6role_messages() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Real OpenClaw shapes (verified against
+        // ~/.openclaw/agents/*/sessions/*.jsonl): an assistant `message`
+        // record with text + toolCall + thinking blocks, followed by a
+        // *top-level* `toolResult`-role `message` record (not nested inside
+        // the assistant's content array) whose own content array holds a
+        // single `toolResult`-typed block carrying many redundant id fields
+        // that all equal the toolCall's id.
+        let content = concat!(
+            r#"{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"Please check that file"}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"m2","timestamp":"2026-03-01T00:00:00.000Z","message":{"role":"assistant","model":"claude-opus-4-6","content":[{"type":"text","text":"Let me check that file."},{"type":"toolCall","id":"call_1","name":"bash","arguments":{"cmd":"cat file.txt"}},{"type":"thinking","text":"I should read the file first."}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"m3","timestamp":"2026-03-01T00:00:01.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"toolResult","id":"call_1","toolCallId":"call_1","toolUseId":"call_1","tool_use_id":"call_1","toolName":"bash","name":"bash","content":"file contents here","text":"file contents here"}]}}"#,
+            "\n",
+        );
+        write_session(&sessions, "session.jsonl", &[content]);
+
+        let connector = OpenClawConnector::new();
+        let ctx = ScanContext::local_default(sessions.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+
+        let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
+        assert!(roles.contains(&"tool_call"), "roles: {roles:?}");
+        assert!(roles.contains(&"tool_result"), "roles: {roles:?}");
+        assert!(roles.contains(&"reasoning"), "roles: {roles:?}");
+        assert!(
+            !roles.iter().any(|r| matches!(*r, "agent" | "toolResult")),
+            "no message may use a pre-6-role name: {roles:?}"
+        );
+
+        let assistant = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant prose message");
+        assert!(!assistant.content.contains("[tool:"));
+        assert!(assistant.content.contains("Let me check that file."));
+        assert_eq!(assistant.author.as_deref(), Some("claude-opus-4-6"));
+
+        let tool_call = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call")
+            .expect("tool_call message");
+        assert!(tool_call.content.contains("bash"));
+        let tool_call_id = tool_call
+            .extra
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .expect("tool_call extra[\"tool_call_id\"] must be set");
+        assert_eq!(tool_call_id, "call_1");
+        assert_eq!(
+            tool_call.extra["tool_call_args"]["cmd"], "cat file.txt",
+            "full args must be preserved in extra, never truncated"
+        );
+
+        let tool_result = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("tool_result message (from a *top-level* toolResult-role message)");
+        assert_eq!(
+            tool_result.content, "file contents here",
+            "tool_result content must be the FULL result, never truncated"
+        );
+        assert_eq!(
+            tool_result
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some(tool_call_id),
+            "tool_result pairs to its tool_call via extra[\"tool_call_id\"], not content order"
+        );
+
+        let reasoning = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("thinking block must become its own reasoning message");
+        assert_eq!(reasoning.content, "I should read the file first.");
+        assert!(
+            !assistant.content.contains("I should read the file first."),
+            "thinking must not be inlined into the assistant message anymore"
+        );
+
+        // idx must be contiguous 0..N after splitting one raw message-line
+        // into several typed messages (spec §3.4) -- required since
+        // openclaw did not previously call `reindex_messages`.
+        assert!(
+            conv.messages
+                .iter()
+                .enumerate()
+                .all(|(i, m)| m.idx as usize == i),
+            "idx not contiguous: {:?}",
+            conv.messages.iter().map(|m| m.idx).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scan_openclaw_top_level_tool_result_text_block_variant() {
+        // Real OpenClaw sessions sometimes emit a top-level `toolResult`
+        // message whose content array holds a plain `text`-typed block
+        // (not a `toolResult`-typed block) -- the pairing id then lives
+        // only on the message itself (`toolCallId`), not in a nested
+        // block's fields. Verified against a real
+        // ~/.openclaw/agents/*/sessions/*.jsonl session.
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = concat!(
+            r#"{"type":"message","id":"m1","message":{"role":"assistant","model":"gpt-5.5","content":[{"type":"toolCall","id":"call_2","name":"exec","arguments":{"cmd":"ls"}}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"m2","message":{"role":"toolResult","toolCallId":"call_2","toolName":"exec","content":[{"type":"text","text":"file_a.txt\nfile_b.txt"}]}}"#,
+            "\n",
+        );
+        write_session(&sessions, "session.jsonl", &[content]);
+
+        let connector = OpenClawConnector::new();
+        let ctx = ScanContext::local_default(sessions.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+
+        let tool_result = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("text-block-variant toolResult message must still become tool_result");
+        assert_eq!(tool_result.content, "file_a.txt\nfile_b.txt");
+        assert_eq!(
+            tool_result
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some("call_2"),
+            "pairing id must come from the message-level toolCallId when the \
+             nested block carries no id fields of its own"
+        );
     }
 
     #[test]
