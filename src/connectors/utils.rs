@@ -203,6 +203,91 @@ pub fn flatten_content(val: &serde_json::Value) -> String {
     String::new()
 }
 
+/// A single content-array element, split by block type rather than merged
+/// into one flattened string.
+///
+/// Unlike [`flatten_content`] (which collapses everything into a single
+/// display string and drops `tool_result`/`thinking` blocks entirely), this
+/// preserves each block's full structure and type so callers can emit typed
+/// 6-role messages. `ToolCall.input` and `ToolResult.content` always carry
+/// the complete, untruncated value — truncation is an adapter-feed concern,
+/// never a canonical/franken one.
+pub(crate) enum TypedBlock {
+    /// `{"type":"text","text":...}` (also covers `input_text`/`output_text`).
+    Text(String),
+    /// `{"type":"tool_use",...}` — full args preserved in `input`.
+    ToolCall {
+        name: String,
+        input: Option<serde_json::Value>,
+        id: Option<String>,
+    },
+    /// `{"type":"tool_result",...}` — full content preserved.
+    ToolResult {
+        content: Option<serde_json::Value>,
+        tool_use_id: Option<String>,
+    },
+    /// `{"type":"thinking","text":...}`.
+    Thinking(String),
+}
+
+/// Split a content array (or plain string) into typed blocks by block type,
+/// instead of flattening everything into one string.
+///
+/// This is the typed counterpart to [`flatten_content`]: it keeps
+/// `tool_result` and `thinking` blocks (which `flatten_content`'s whitelist
+/// drops) and preserves full `tool_use`/`tool_result` payloads unmodified.
+/// Malformed blocks (missing required fields) are skipped rather than
+/// causing a panic.
+#[must_use]
+pub(crate) fn split_content_blocks(v: &serde_json::Value) -> Vec<TypedBlock> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+
+    let mut blocks = Vec::new();
+    for item in arr {
+        let item_type = item.get("type").and_then(|t| t.as_str());
+        match item_type {
+            Some("text") | Some("input_text") | Some("output_text") => {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    blocks.push(TypedBlock::Text(text.to_string()));
+                }
+            }
+            Some("tool_use") => {
+                let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let id = item
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .map(std::string::ToString::to_string);
+                blocks.push(TypedBlock::ToolCall {
+                    name: name.to_string(),
+                    input: item.get("input").cloned(),
+                    id,
+                });
+            }
+            Some("tool_result") => {
+                let tool_use_id = item
+                    .get("tool_use_id")
+                    .and_then(|i| i.as_str())
+                    .map(std::string::ToString::to_string);
+                blocks.push(TypedBlock::ToolResult {
+                    content: item.get("content").cloned(),
+                    tool_use_id,
+                });
+            }
+            Some("thinking") => {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    blocks.push(TypedBlock::Thinking(text.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
 /// Extract text content from a single content block item.
 fn extract_content_part(item: &serde_json::Value) -> Option<String> {
     if let Some(text) = item.as_str() {
@@ -637,5 +722,27 @@ mod tests {
         assert_eq!(invocations[0].kind, "tool");
         assert_eq!(invocations[0].name, "skill");
         assert!(invocations[0].raw_name.is_none());
+    }
+
+    // --- split_content_blocks tests ---
+
+    #[test]
+    fn split_content_blocks_separates_text_tooluse_toolresult_thinking() {
+        let v = json!([
+            {"type":"text","text":"hi"},
+            {"type":"tool_use","name":"Read","id":"tu_1","input":{"file_path":"/a"}},
+            {"type":"tool_result","tool_use_id":"tu_1","content":"file body"},
+            {"type":"thinking","text":"let me think"}
+        ]);
+        let blocks = split_content_blocks(&v);
+        assert_eq!(blocks.len(), 4);
+        assert!(matches!(blocks[0], TypedBlock::Text(ref t) if t=="hi"));
+        assert!(
+            matches!(&blocks[1], TypedBlock::ToolCall{name, id, ..} if name=="Read" && id.as_deref()==Some("tu_1"))
+        );
+        assert!(
+            matches!(&blocks[2], TypedBlock::ToolResult{tool_use_id, ..} if tool_use_id.as_deref()==Some("tu_1"))
+        );
+        assert!(matches!(blocks[3], TypedBlock::Thinking(ref t) if t=="let me think"));
     }
 }
