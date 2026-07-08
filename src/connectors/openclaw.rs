@@ -575,12 +575,16 @@ impl Connector for OpenClawConnector {
                             // real sessions plain `text` -- both shapes
                             // verified against real ~/.openclaw sessions).
                             if raw_role == "toolResult" {
+                                // Completeness policy (uniform w/ claude_code.rs
+                                // + codex.rs): never drop a structural item for
+                                // empty content. An empty toolResult body
+                                // (real: 71 `content:[]` results, e.g.
+                                // `update_plan`) is still emitted so the
+                                // tool_call<->tool_result pairing chain
+                                // survives.
                                 let result_text = content
                                     .map(Self::openclaw_tool_result_text)
                                     .unwrap_or_default();
-                                if result_text.trim().is_empty() {
-                                    continue;
-                                }
                                 let pairing_id =
                                     Self::openclaw_pairing_id_from(msg).or_else(|| {
                                         content
@@ -694,9 +698,11 @@ impl Connector for OpenClawConnector {
                                                 });
                                             }
                                             OpenClawBlock::ToolResult { text, id } => {
-                                                if text.trim().is_empty() {
-                                                    continue;
-                                                }
+                                                // Completeness policy (uniform
+                                                // w/ claude_code.rs + codex.rs):
+                                                // an empty tool_result body is
+                                                // still emitted, keeping its
+                                                // pairing id.
                                                 let mut extra = base_extra.clone();
                                                 if let (Value::Object(map), Some(call_id)) =
                                                     (&mut extra, &id)
@@ -1124,6 +1130,87 @@ mod tests {
             Some("call_2"),
             "pairing id must come from the message-level toolCallId when the \
              nested block carries no id fields of its own"
+        );
+    }
+
+    #[test]
+    fn scan_openclaw_top_level_empty_tool_result_still_emitted_with_pairing() {
+        // Completeness policy (uniform w/ claude_code.rs + codex.rs): never
+        // drop a structural item for empty content. Real OpenClaw sessions
+        // contain 71 empty toolResults (all `content:[]` with a
+        // `toolCallId`, e.g. `update_plan` whose result body is empty) --
+        // dropping them silently breaks the tool_call<->tool_result pairing
+        // chain. The empty tool_result must still be emitted, keeping its
+        // pairing id.
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = concat!(
+            r#"{"type":"message","id":"m1","message":{"role":"assistant","model":"gpt-5.5","content":[{"type":"toolCall","id":"call_9","name":"update_plan","arguments":{"plan":"x"}}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"m2","message":{"role":"toolResult","toolCallId":"call_9","toolName":"update_plan","content":[]}}"#,
+            "\n",
+        );
+        write_session(&sessions, "session.jsonl", &[content]);
+
+        let connector = OpenClawConnector::new();
+        let ctx = ScanContext::local_default(sessions.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+
+        let tool_result = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("empty top-level toolResult must STILL be emitted (completeness policy)");
+        assert_eq!(
+            tool_result.content, "",
+            "empty toolResult content is preserved as empty, not dropped"
+        );
+        assert_eq!(
+            tool_result
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some("call_9"),
+            "empty tool_result keeps its pairing id so the tool_call<->tool_result chain survives"
+        );
+    }
+
+    #[test]
+    fn scan_openclaw_content_block_empty_tool_result_still_emitted_with_pairing() {
+        // Same completeness policy for the content-block toolResult path (a
+        // toolResult block nested inside a non-toolResult-role message): an
+        // empty body must still emit a tool_result carrying its pairing id.
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = concat!(
+            r#"{"type":"message","id":"m1","message":{"role":"assistant","model":"gpt-5.5","content":[{"type":"text","text":"done"},{"type":"toolResult","id":"call_7","toolCallId":"call_7","toolUseId":"call_7","tool_use_id":"call_7","content":""}]}}"#,
+            "\n",
+        );
+        write_session(&sessions, "session.jsonl", &[content]);
+
+        let connector = OpenClawConnector::new();
+        let ctx = ScanContext::local_default(sessions.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+
+        let tool_result = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("empty content-block toolResult must STILL be emitted (completeness policy)");
+        assert_eq!(tool_result.content, "");
+        assert_eq!(
+            tool_result
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some("call_7"),
+            "empty content-block tool_result keeps its pairing id"
         );
     }
 
