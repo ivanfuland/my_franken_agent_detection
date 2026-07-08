@@ -753,6 +753,45 @@ impl Connector for OpenClawConnector {
                                 None => {}
                             }
                         }
+                        "compaction" => {
+                            // `compaction` events carry a substantive
+                            // multi-paragraph `summary` (a running digest of
+                            // the conversation), directly analogous to
+                            // claude's `away_summary`. Spec §3.3: wrapper
+                            // events with SUBSTANTIVE content -> `system` role
+                            // (NOT dropped). Only emit when `summary` is a
+                            // non-empty string; an absent/empty summary has no
+                            // content -> drop. Routed through the same
+                            // `messages` vector so the `reindex_messages` call
+                            // below renumbers it into the contiguous idx run.
+                            if let Some(summary) = val
+                                .get("summary")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.trim().is_empty())
+                            {
+                                let created = val.get("timestamp").and_then(parse_timestamp);
+                                started_at = match (started_at, created) {
+                                    (Some(curr), Some(ts)) => Some(curr.min(ts)),
+                                    (None, Some(ts)) => Some(ts),
+                                    (other, None) => other,
+                                };
+                                ended_at = match (ended_at, created) {
+                                    (Some(curr), Some(ts)) => Some(curr.max(ts)),
+                                    (None, Some(ts)) => Some(ts),
+                                    (other, None) => other,
+                                };
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: "system".to_string(),
+                                    author: None,
+                                    created_at: created,
+                                    content: summary.to_string(),
+                                    extra: val,
+                                    invocations: Vec::new(),
+                                    snippets: Vec::new(),
+                                });
+                            }
+                        }
                         // Skip model_change, thinking_level_change, custom, etc.
                         // Verified against real ~/.openclaw sessions (scan of
                         // ~200 files): `session`/`thinking_level_change`/
@@ -760,9 +799,10 @@ impl Connector for OpenClawConnector {
                         // thinking-level string, provider/modelId); `custom`
                         // entries in this fork are all `customType:
                         // "model-snapshot"` (provider/modelId metadata). None
-                        // carries substantive user-facing content that should
-                        // instead become a `system` message (unlike claude's
-                        // `away_summary`), so dropping them is correct.
+                        // of these carries substantive user-facing content, so
+                        // dropping them is correct. (`compaction` DOES carry
+                        // substantive prose and is handled above as `system`,
+                        // like claude's `away_summary`.)
                         _ => {}
                     }
                 }
@@ -1085,6 +1125,85 @@ mod tests {
             "pairing id must come from the message-level toolCallId when the \
              nested block carries no id fields of its own"
         );
+    }
+
+    #[test]
+    fn scan_openclaw_compaction_summary_becomes_system_message() {
+        // Real OpenClaw sessions emit `compaction` wrapper events carrying a
+        // substantive multi-paragraph `summary` (a running digest of the
+        // conversation), directly analogous to claude's `away_summary`.
+        // Spec §3.3: wrapper events with SUBSTANTIVE content -> `system`
+        // role (not dropped). Verified against 41 real compaction events
+        // across ~/.openclaw/agents/*/sessions/*.jsonl.
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = concat!(
+            r#"{"type":"message","id":"m1","timestamp":"2026-03-01T00:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
+            r###"{"type":"compaction","id":"c1","parentId":"m1","timestamp":"2026-03-01T00:00:01.000Z","summary":"## Decisions\n- Kept the plan.\n- Shipped it.","tokensBefore":12000}"###,
+            "\n",
+        );
+        write_session(&sessions, "session.jsonl", &[content]);
+
+        let connector = OpenClawConnector::new();
+        let ctx = ScanContext::local_default(sessions.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+
+        let system = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("compaction summary must become a system message, not be dropped");
+        assert_eq!(
+            system.content,
+            "## Decisions\n- Kept the plan.\n- Shipped it."
+        );
+        assert!(
+            system.author.is_none(),
+            "system message from a compaction summary has no model author"
+        );
+
+        // idx stays contiguous 0..N after the compaction system message is
+        // routed through the same vector as the message(s) (spec §3.4).
+        assert!(
+            convs[0]
+                .messages
+                .iter()
+                .enumerate()
+                .all(|(i, m)| usize::try_from(m.idx).unwrap() == i)
+        );
+    }
+
+    #[test]
+    fn scan_openclaw_compaction_without_summary_is_dropped() {
+        // A compaction event with an absent/empty `summary` carries no
+        // substantive content -> drop (no system message).
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = concat!(
+            r#"{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
+            r#"{"type":"compaction","id":"c1","summary":"","tokensBefore":12000}"#,
+            "\n",
+            r#"{"type":"compaction","id":"c2","tokensBefore":12000}"#,
+            "\n",
+        );
+        write_session(&sessions, "session.jsonl", &[content]);
+
+        let connector = OpenClawConnector::new();
+        let ctx = ScanContext::local_default(sessions.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert!(
+            convs[0].messages.iter().all(|m| m.role != "system"),
+            "empty/absent compaction summary must not emit a system message"
+        );
+        assert_eq!(convs[0].messages.len(), 1);
     }
 
     #[test]
