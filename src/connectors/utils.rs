@@ -278,7 +278,17 @@ pub(crate) fn split_content_blocks(v: &serde_json::Value) -> Vec<TypedBlock> {
                 });
             }
             Some("thinking") => {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                // Real signed Anthropic thinking blocks carry the reasoning in
+                // the `thinking` key (with a `signature`), matching
+                // `pi_agent.rs`; openclaw's normalized shape uses `text`. Read
+                // `thinking` first, fall back to `text`. An empty-string value
+                // still yields a block (real signed blocks can have empty text)
+                // rather than being silently dropped.
+                if let Some(text) = item
+                    .get("thinking")
+                    .or_else(|| item.get("text"))
+                    .and_then(|t| t.as_str())
+                {
                     blocks.push(TypedBlock::Thinking(text.to_string()));
                 }
             }
@@ -744,5 +754,13 @@ mod tests {
             matches!(&blocks[2], TypedBlock::ToolResult{tool_use_id, ..} if tool_use_id.as_deref()==Some("tu_1"))
         );
         assert!(matches!(blocks[3], TypedBlock::Thinking(ref t) if t=="let me think"));
+    }
+
+    #[test]
+    fn split_content_blocks_thinking_uses_anthropic_thinking_key() {
+        let v = json!([{"type":"thinking","thinking":"real reasoning","signature":"sig"}]);
+        let blocks = split_content_blocks(&v);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(blocks[0], TypedBlock::Thinking(ref t) if t=="real reasoning"));
     }
 }
