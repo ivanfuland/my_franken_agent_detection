@@ -6,12 +6,17 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{
+    TypedBlock, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    split_content_blocks,
+};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct ClaudeCodeConnector;
 
@@ -394,6 +399,31 @@ impl ClaudeCodeConnector {
             Value::Object(out)
         }
     }
+
+    /// Render a `tool_use` block's own content: `<name>(<args JSON>)`, or
+    /// just `<name>` when there's no input. This is prose for a human/
+    /// embedding to skim — the full untruncated args always live in
+    /// `extra["tool_call_args"]` for exact reconstruction (canonical args
+    /// are never truncated; a content cap would be an adapter-feed concern,
+    /// which we don't add here — see spec §3.2).
+    fn render_tool_call_content(name: &str, input: Option<&Value>) -> String {
+        match input {
+            Some(value) if !value.is_null() => format!("{name}({value})"),
+            _ => name.to_string(),
+        }
+    }
+
+    /// Render a `tool_result` block's content. The block's `content` may be
+    /// a plain string or an array of text blocks (the same shapes
+    /// `split_content_blocks` already parses) — never truncated.
+    fn render_tool_result_content(content: Option<&Value>) -> String {
+        match content {
+            Some(Value::String(s)) => s.clone(),
+            Some(value @ Value::Array(_)) => flatten_content(value),
+            Some(value) => value.to_string(),
+            None => String::new(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -516,7 +546,17 @@ fn scan_claude_with_callback_with_exclusions(
                     let is_user_assistant = matches!(entry_type, Some("user" | "assistant"))
                         || (entry_type == Some("message")
                             && matches!(role_hint, Some("user" | "assistant")));
-                    if !is_user_assistant {
+                    // Claude `system` records carry several subtypes (spec §3.3,
+                    // P1-2): `away_summary` has real content and becomes a
+                    // `system` message (the adapter drops it later);
+                    // `turn_duration`/`stop_hook_summary` are pure metrics, and
+                    // everything else (`permission-mode`/`mode`/`last-prompt`,
+                    // covered by top-level `type` values other than `system` and
+                    // already excluded above) is config noise — both classes are
+                    // dropped explicitly rather than silently mis-typed.
+                    let is_system_away_summary = entry_type == Some("system")
+                        && val.get("subtype").and_then(|v| v.as_str()) == Some("away_summary");
+                    if !is_user_assistant && !is_system_away_summary {
                         continue;
                     }
 
@@ -534,39 +574,179 @@ fn scan_claude_with_callback_with_exclusions(
                         (None, None) => None,
                     };
 
+                    let base_extra = if compact_message_extra {
+                        ClaudeCodeConnector::compact_message_extra(&val)
+                    } else {
+                        val.clone()
+                    };
+
+                    if is_system_away_summary {
+                        let content_str =
+                            ClaudeCodeConnector::non_empty_json_string(&val, "content")
+                                .unwrap_or_default();
+                        if !content_str.trim().is_empty() {
+                            messages.push(NormalizedMessage {
+                                idx: 0,
+                                role: "system".to_string(),
+                                author: None,
+                                created_at: created,
+                                content: content_str,
+                                extra: base_extra,
+                                invocations: Vec::new(),
+                                snippets: Vec::new(),
+                            });
+                        }
+                        continue;
+                    }
+
                     let role = role_hint.or(entry_type).unwrap_or("agent");
                     let content_val = val
                         .get("message")
                         .and_then(|m| m.get("content"))
                         .or_else(|| val.get("content"));
-                    let content_str = content_val.map(flatten_content).unwrap_or_default();
-
-                    if content_str.trim().is_empty() {
-                        continue;
-                    }
-
                     let author = val
                         .get("message")
                         .and_then(|m| m.get("model"))
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    let invocations =
-                        content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
 
-                    messages.push(NormalizedMessage {
-                        idx: 0,
-                        role: role.to_string(),
-                        author,
-                        created_at: created,
-                        content: content_str,
-                        extra: if compact_message_extra {
-                            ClaudeCodeConnector::compact_message_extra(&val)
-                        } else {
-                            val
-                        },
-                        invocations,
-                        snippets: Vec::new(),
-                    });
+                    match content_val {
+                        Some(Value::Array(_)) => {
+                            // Real Claude Code content arrays interleave prose
+                            // text, tool_use, tool_result, and thinking blocks.
+                            // Split by type (Task 1.1's split_content_blocks)
+                            // instead of flattening everything into one string,
+                            // so each structural block becomes its own typed
+                            // 6-role message (spec §3.3) rather than an inline
+                            // `[Tool:...]` marker glued into assistant prose.
+                            let blocks = split_content_blocks(content_val.unwrap());
+
+                            let mut prose = String::new();
+                            for block in &blocks {
+                                if let TypedBlock::Text(text) = block {
+                                    if !prose.is_empty() {
+                                        prose.push('\n');
+                                    }
+                                    prose.push_str(text);
+                                }
+                            }
+                            if !prose.trim().is_empty() {
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: role.to_string(),
+                                    author: author.clone(),
+                                    created_at: created,
+                                    content: prose,
+                                    extra: base_extra.clone(),
+                                    invocations: Vec::new(),
+                                    snippets: Vec::new(),
+                                });
+                            }
+
+                            for block in blocks {
+                                match block {
+                                    TypedBlock::Text(_) => {}
+                                    TypedBlock::ToolCall { name, input, id } => {
+                                        let content = ClaudeCodeConnector::render_tool_call_content(
+                                            &name,
+                                            input.as_ref(),
+                                        );
+                                        let mut extra = base_extra.clone();
+                                        if let Value::Object(map) = &mut extra {
+                                            if let Some(ref call_id) = id {
+                                                map.insert(
+                                                    "tool_call_id".to_string(),
+                                                    Value::String(call_id.clone()),
+                                                );
+                                            }
+                                            map.insert(
+                                                "tool_call_args".to_string(),
+                                                input.clone().unwrap_or(Value::Null),
+                                            );
+                                        }
+                                        // tool_call/tool_result pairing is via
+                                        // this explicit id (extra["tool_call_id"]),
+                                        // never content order (spec P-原则-3).
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "tool_call".to_string(),
+                                            author: author.clone(),
+                                            created_at: created,
+                                            content,
+                                            extra,
+                                            invocations: vec![NormalizedInvocation {
+                                                kind: "tool".to_string(),
+                                                name,
+                                                raw_name: None,
+                                                call_id: id,
+                                                arguments: input,
+                                            }],
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                    TypedBlock::ToolResult {
+                                        content,
+                                        tool_use_id,
+                                    } => {
+                                        let content_str =
+                                            ClaudeCodeConnector::render_tool_result_content(
+                                                content.as_ref(),
+                                            );
+                                        let mut extra = base_extra.clone();
+                                        if let (Value::Object(map), Some(call_id)) =
+                                            (&mut extra, &tool_use_id)
+                                        {
+                                            map.insert(
+                                                "tool_call_id".to_string(),
+                                                Value::String(call_id.clone()),
+                                            );
+                                        }
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "tool_result".to_string(),
+                                            author: None,
+                                            created_at: created,
+                                            content: content_str,
+                                            extra,
+                                            invocations: Vec::new(),
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                    TypedBlock::Thinking(text) => {
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "reasoning".to_string(),
+                                            author: author.clone(),
+                                            created_at: created,
+                                            content: text,
+                                            extra: base_extra.clone(),
+                                            invocations: Vec::new(),
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Some(other) => {
+                            // Not a content-block array (e.g. a plain string) —
+                            // no tool_use/tool_result/thinking blocks are
+                            // possible here, so no invocations to extract.
+                            let content_str = flatten_content(other);
+                            if !content_str.trim().is_empty() {
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: role.to_string(),
+                                    author,
+                                    created_at: created,
+                                    content: content_str,
+                                    extra: base_extra,
+                                    invocations: Vec::new(),
+                                    snippets: Vec::new(),
+                                });
+                            }
+                        }
+                        None => {}
+                    }
                 }
                 crate::types::reindex_messages(&mut messages);
             } else {
@@ -1336,6 +1516,172 @@ mod tests {
         assert_eq!(convs[0].messages[0].idx, 0);
         assert_eq!(convs[0].messages[1].idx, 1);
         assert_eq!(convs[0].messages[2].idx, 2);
+    }
+
+    // =========================================================================
+    // 6-role normalization tests (franken fork, spec §3.3 claude)
+    // =========================================================================
+
+    #[test]
+    fn scan_claude_splits_content_blocks_into_typed_6role_messages() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let session_file = claude_dir.join("session.jsonl");
+        // Real Claude Code raw shapes (verified against ~/.claude/projects):
+        // assistant record with text + tool_use + thinking blocks, followed
+        // by a user record carrying the paired tool_result block.
+        let content = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","model":"claude-opus-4-6","content":[{"type":"text","text":"Let me check that file."},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"/tmp/foo.txt"}},{"type":"thinking","thinking":"I should read the file first.","signature":"sig123"}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"file contents here"}]}}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+
+        let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
+        assert!(roles.contains(&"tool_call"), "roles: {roles:?}");
+        assert!(roles.contains(&"tool_result"), "roles: {roles:?}");
+        assert!(roles.contains(&"reasoning"), "roles: {roles:?}");
+        assert!(!roles.contains(&"agent"), "roles: {roles:?}");
+
+        let assistant = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant prose message");
+        assert!(!assistant.content.contains("[Tool:"));
+        assert!(assistant.content.contains("Let me check that file."));
+        assert_eq!(assistant.author.as_deref(), Some("claude-opus-4-6"));
+
+        let tool_call = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call")
+            .expect("tool_call message");
+        assert!(tool_call.content.contains("Read"));
+        assert_eq!(
+            tool_call.extra["tool_call_id"].as_str(),
+            Some("toolu_01"),
+            "tool_call's own id must be stored for the tool_result to pair against"
+        );
+        assert_eq!(
+            tool_call.extra["tool_call_args"]["file_path"], "/tmp/foo.txt",
+            "full args must be preserved in extra, never truncated"
+        );
+
+        let tool_result = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("tool_result message");
+        assert!(tool_result.extra.get("tool_call_id").is_some());
+        assert_eq!(tool_result.extra["tool_call_id"].as_str(), Some("toolu_01"));
+        assert_eq!(tool_result.content, "file contents here");
+
+        let reasoning = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("reasoning message");
+        assert_eq!(reasoning.content, "I should read the file first.");
+
+        // idx must be contiguous 0..N after splitting one raw record into
+        // several messages (spec §3.4).
+        assert!(
+            conv.messages
+                .iter()
+                .enumerate()
+                .all(|(i, m)| m.idx as usize == i)
+        );
+    }
+
+    #[test]
+    fn scan_claude_thinking_block_emits_reasoning_even_when_empty() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let session_file = claude_dir.join("session.jsonl");
+        let content = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"thinking","thinking":"","signature":"sig"}]}}"#;
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        let reasoning = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("empty-text thinking block must still emit a reasoning message");
+        assert_eq!(reasoning.content, "");
+    }
+
+    #[test]
+    fn scan_claude_system_away_summary_becomes_system_message() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let session_file = claude_dir.join("session.jsonl");
+        let content = concat!(
+            r#"{"type":"system","subtype":"away_summary","timestamp":"2026-01-01T00:00:00Z","content":"Syncing your vault. Two git pulls done."}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let system_msg = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("away_summary should produce a system message");
+        assert!(system_msg.content.contains("Syncing your vault"));
+        assert!(system_msg.author.is_none());
+    }
+
+    #[test]
+    fn scan_claude_system_metric_and_config_subtypes_are_dropped() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let session_file = claude_dir.join("session.jsonl");
+        // stop_hook_summary / turn_duration are pure-metric `system` subtypes;
+        // permission-mode / last-prompt are separate top-level `type` values
+        // that carry config noise. Both classes must be dropped explicitly
+        // (spec §3.3 P1-2), not silently mis-typed into another role.
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"stop_hook_summary","hookCount":2}"#,
+            "\n",
+            r#"{"type":"system","subtype":"turn_duration","durationMs":151876}"#,
+            "\n",
+            r#"{"type":"permission-mode","permissionMode":"bypassPermissions"}"#,
+            "\n",
+            r#"{"type":"last-prompt","lastPrompt":"pull"}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].role, "user");
     }
 
     // =========================================================================
