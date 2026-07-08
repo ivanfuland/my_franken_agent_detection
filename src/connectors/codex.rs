@@ -686,13 +686,19 @@ fn scan_codex_with_callback(
                                     // user/developer `input_text`, or legacy
                                     // string content.
                                     _ => {
+                                        // A role-less `message`-shaped item does
+                                        // not occur in real codex rollouts;
+                                        // default to `user` (a valid 6-role,
+                                        // matching CASS's `unwrap_or(ROLE_USER)`
+                                        // convention) rather than the forbidden
+                                        // `agent`, so the fallback stays
+                                        // 6-role-safe while keeping the content.
                                         let raw_role = payload
                                             .get("role")
                                             .and_then(|v| v.as_str())
-                                            .unwrap_or("agent");
+                                            .unwrap_or("user");
                                         // `developer` -> `system` (rename); all
-                                        // other roles (user/assistant/the
-                                        // unreachable-in-practice default) pass
+                                        // other roles (user/assistant) pass
                                         // through unchanged.
                                         let role = if raw_role == "developer" {
                                             "system"
@@ -1976,6 +1982,57 @@ not valid json at all
         );
     }
 
+    #[test]
+    fn scan_attaches_token_count_to_assistant_with_model_author() {
+        // Regression guard for the `is_token_usage_target_message` change
+        // (`author.is_none()` -> `role == "assistant"`). Real rollouts carry
+        // a `turn_context.model`, so real assistant messages get
+        // `author = Some(model)`. The OLD guard required `author.is_none()`
+        // and would therefore SKIP attaching token usage to every real
+        // assistant turn -- yet every other token-usage test uses a fixture
+        // with no `turn_context`, so `author` stays `None` and the old buggy
+        // guard passes them. This test includes a `turn_context` line so the
+        // assistant has a real model author, proving token usage still
+        // attaches.
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"turn_context","timestamp":"2025-12-01T09:59:59Z","payload":{"model":"gpt-5.5"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Question"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"assistant","content":"Answer"}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:02Z","payload":{"type":"token_count","input_tokens":13,"output_tokens":21}}
+"#;
+        fs::write(sessions.join("rollout-token-model-author.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let assistant = &convs[0].messages[1];
+        assert_eq!(assistant.content, "Answer");
+        // The assistant carries the real model as its author -- exactly the
+        // case the old guard would have excluded.
+        assert_eq!(assistant.author.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            assistant
+                .extra
+                .pointer("/cass/token_usage/input_tokens")
+                .and_then(Value::as_i64),
+            Some(13),
+            "token usage must still attach to a real assistant turn that has a model author"
+        );
+        assert_eq!(
+            assistant
+                .extra
+                .pointer("/cass/token_usage/output_tokens")
+                .and_then(Value::as_i64),
+            Some(21)
+        );
+    }
+
     // =====================================================
     // scan() Legacy JSON Format Tests
     // =====================================================
@@ -2391,7 +2448,7 @@ not valid json at all
     }
 
     #[test]
-    fn scan_uses_default_role_when_missing() {
+    fn scan_defaults_missing_role_to_user() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
         let sessions = codex_dir.join("sessions");
@@ -2407,8 +2464,10 @@ not valid json at all
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
-        // Default role should be "agent"
-        assert_eq!(convs[0].messages[0].role, "agent");
+        // Default role must be a valid 6-role (`user`), never the forbidden
+        // `agent` -- a role-less codex message doesn't occur in real data,
+        // so this only makes the fallback 6-role-safe.
+        assert_eq!(convs[0].messages[0].role, "user");
     }
 
     #[test]
