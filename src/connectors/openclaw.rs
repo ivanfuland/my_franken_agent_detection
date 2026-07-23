@@ -308,21 +308,58 @@ impl OpenClawConnector {
         }
     }
 
-    /// Resolve a `toolResult`'s pairing id from a single JSON object (either
-    /// the top-level `message` or a nested content block): prefer
-    /// `toolCallId`, falling back to `toolUseId`/`tool_use_id`/`id` -- all
-    /// equal to the originating `toolCall`'s id in real `~/.openclaw`
-    /// sessions (spec §3.3 openclaw).
-    fn openclaw_pairing_id_from(v: &Value) -> Option<String> {
-        ["toolCallId", "toolUseId", "tool_use_id", "id"]
-            .iter()
-            .find_map(|key| {
-                v.get(*key)
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(String::from)
-            })
+    fn merge_openclaw_pairing_id(
+        resolved: &mut Option<String>,
+        candidate: Option<String>,
+    ) -> Result<()> {
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        match resolved {
+            Some(existing) if existing != &candidate => {
+                anyhow::bail!("OpenClaw tool result pairing identifiers conflict");
+            }
+            Some(_) => {}
+            None => *resolved = Some(candidate),
+        }
+        Ok(())
+    }
+
+    /// Resolve a `toolResult` pairing id from one structural object. All
+    /// non-blank explicit id fields must agree; redundant equal fields are
+    /// accepted, while distinct ids fail without being copied into the error.
+    fn openclaw_pairing_id_from(v: &Value) -> Result<Option<String>> {
+        let mut resolved = None;
+        for key in ["toolCallId", "toolUseId", "tool_use_id", "id"] {
+            let candidate = v
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(String::from);
+            Self::merge_openclaw_pairing_id(&mut resolved, candidate)?;
+        }
+        Ok(resolved)
+    }
+
+    /// Merge the outer top-level `toolResult` message id with ids from only
+    /// typed `toolResult` content blocks. Other block ids belong to other
+    /// structures and must never participate in tool-result pairing.
+    fn openclaw_top_level_tool_result_pairing_id(
+        message: &Value,
+        content: Option<&Value>,
+    ) -> Result<Option<String>> {
+        let mut resolved = Self::openclaw_pairing_id_from(message)?;
+        if let Some(blocks) = content.and_then(Value::as_array) {
+            for block in blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("toolResult"))
+            {
+                let candidate = Self::openclaw_pairing_id_from(block)?;
+                Self::merge_openclaw_pairing_id(&mut resolved, candidate)?;
+            }
+        }
+        Ok(resolved)
     }
 
     /// Extract a single content block's own result body: prefers `content`
@@ -360,9 +397,9 @@ impl OpenClawConnector {
     /// uses its own camelCase block vocabulary (`toolCall`/`toolResult`)
     /// rather than Anthropic's (`tool_use`/`tool_result`), so this doesn't
     /// reuse `split_content_blocks` (task 1.1) verbatim.
-    fn split_openclaw_blocks(content: &Value) -> Vec<OpenClawBlock> {
+    fn split_openclaw_blocks(content: &Value) -> Result<Vec<OpenClawBlock>> {
         let Some(arr) = content.as_array() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let mut blocks = Vec::new();
@@ -397,7 +434,7 @@ impl OpenClawConnector {
                     // (toolResult always arrives as its own top-level
                     // message -- handled separately in `scan`), but the
                     // spec calls for handling both shapes explicitly.
-                    let id = Self::openclaw_pairing_id_from(block);
+                    let id = Self::openclaw_pairing_id_from(block)?;
                     let text = Self::openclaw_block_body(block).unwrap_or_default();
                     blocks.push(OpenClawBlock::ToolResult { text, id });
                 }
@@ -409,7 +446,7 @@ impl OpenClawConnector {
                 _ => {}
             }
         }
-        blocks
+        Ok(blocks)
     }
 }
 
@@ -611,11 +648,7 @@ impl Connector for OpenClawConnector {
                                     .map(Self::openclaw_tool_result_text)
                                     .unwrap_or_default();
                                 let pairing_id =
-                                    Self::openclaw_pairing_id_from(msg).or_else(|| {
-                                        content.and_then(Value::as_array).and_then(|arr| {
-                                            arr.iter().find_map(Self::openclaw_pairing_id_from)
-                                        })
-                                    });
+                                    Self::openclaw_top_level_tool_result_pairing_id(msg, content)?;
                                 let mut extra = base_extra;
                                 set_tool_result_pairing(&mut extra, pairing_id.as_deref())?;
                                 messages.push(NormalizedMessage {
@@ -646,7 +679,7 @@ impl Connector for OpenClawConnector {
 
                             match content {
                                 Some(Value::Array(_)) => {
-                                    let blocks = Self::split_openclaw_blocks(content.unwrap());
+                                    let blocks = Self::split_openclaw_blocks(content.unwrap())?;
 
                                     let mut prose = String::new();
                                     for block in &blocks {
@@ -1143,6 +1176,127 @@ mod tests {
 
         assert_eq!(result.extra["tool_call_id"], "valid_late");
         assert!(result.extra.get("unpaired").is_none());
+    }
+
+    #[test]
+    fn scan_openclaw_top_level_tool_result_ignores_ids_on_unrelated_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"anchor","message":{"role":"user","content":"anchor"}}"#,
+                r#"{"type":"message","id":"result","message":{"role":"toolResult","content":[{"type":"text","id":"unrelated-text-id","text":"prefix"},{"type":"toolResult","toolCallId":"real-call","content":"paired"}]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let result = convs[0]
+            .messages
+            .iter()
+            .find(|message| message.role == "tool_result")
+            .expect("tool result");
+
+        assert_eq!(result.extra["tool_call_id"], "real-call");
+        assert_ne!(result.extra["tool_call_id"], "unrelated-text-id");
+        assert!(result.extra.get("unpaired").is_none());
+    }
+
+    #[test]
+    fn scan_openclaw_pairing_conflicts_fail_loud_without_echoing_ids() {
+        let cases = [
+            (
+                "same object",
+                r#"{"type":"message","id":"result","message":{"role":"toolResult","toolCallId":"same-object-a","toolUseId":"same-object-b","content":"result"}}"#,
+                ["same-object-a", "same-object-b"],
+            ),
+            (
+                "outer versus typed block",
+                r#"{"type":"message","id":"result","message":{"role":"toolResult","toolCallId":"outer-a","content":[{"type":"toolResult","toolCallId":"typed-b","content":"result"}]}}"#,
+                ["outer-a", "typed-b"],
+            ),
+            (
+                "multiple typed blocks",
+                r#"{"type":"message","id":"result","message":{"role":"toolResult","content":[{"type":"toolResult","toolCallId":"typed-first","content":"one"},{"type":"toolResult","toolCallId":"typed-second","content":"two"}]}}"#,
+                ["typed-first", "typed-second"],
+            ),
+            (
+                "embedded same object",
+                r#"{"type":"message","id":"result","message":{"role":"assistant","content":[{"type":"toolResult","toolCallId":"embedded-a","tool_use_id":"embedded-b","content":"result"}]}}"#,
+                ["embedded-a", "embedded-b"],
+            ),
+        ];
+
+        let violations = cases
+            .into_iter()
+            .filter_map(|(case, record, forbidden_ids)| {
+                let tmp = TempDir::new().unwrap();
+                let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+                fs::create_dir_all(&sessions).unwrap();
+                write_session(
+                    &sessions,
+                    "session.jsonl",
+                    &[
+                        r#"{"type":"message","id":"anchor","message":{"role":"user","content":"anchor"}}"#,
+                        record,
+                    ],
+                );
+
+                match OpenClawConnector::new()
+                    .scan(&ScanContext::local_default(sessions, None))
+                {
+                    Err(error) => {
+                        let error = error.to_string();
+                        if error.contains("pairing")
+                            && forbidden_ids.iter().all(|id| !error.contains(id))
+                        {
+                            None
+                        } else {
+                            Some(format!("{case}: wrong error: {error}"))
+                        }
+                    }
+                    Ok(_) => Some(format!("{case}: unexpectedly accepted")),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn scan_openclaw_pairing_redundancy_blank_and_missing_ids_remain_valid() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"anchor","message":{"role":"user","content":"anchor"}}"#,
+                r#"{"type":"message","id":"redundant","message":{"role":"toolResult","toolCallId":"same-id","toolUseId":"same-id","content":[{"type":"toolResult","id":"same-id","toolCallId":"same-id","tool_use_id":"same-id","content":"redundant"}]}}"#,
+                r#"{"type":"message","id":"blank","message":{"role":"toolResult","toolCallId":"   ","content":[{"type":"toolResult","toolUseId":"valid-typed","content":"blank outer"}]}}"#,
+                r#"{"type":"message","id":"missing","message":{"role":"toolResult","content":[]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let results = convs[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool_result")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].extra["tool_call_id"], "same-id");
+        assert_eq!(results[1].extra["tool_call_id"], "valid-typed");
+        assert_eq!(results[2].extra["unpaired"], true);
+        assert!(results[2].extra.get("tool_call_id").is_none());
     }
 
     #[test]
