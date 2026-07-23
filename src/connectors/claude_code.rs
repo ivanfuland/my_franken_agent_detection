@@ -7,8 +7,8 @@ use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::{
-    TypedBlock, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
-    split_content_blocks,
+    TypedBlock, add_raw_role, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    set_tool_result_pairing, split_content_blocks,
 };
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
@@ -547,8 +547,8 @@ fn scan_claude_with_callback_with_exclusions(
                         || (entry_type == Some("message")
                             && matches!(role_hint, Some("user" | "assistant")));
                     // Claude `system` records carry several subtypes (spec §3.3,
-                    // P1-2): `away_summary` has real content and becomes a
-                    // `system` message (the adapter drops it later);
+                    // P1-2): `away_summary` has real content and becomes an
+                    // `assistant` message while retaining `raw_role=system`;
                     // `turn_duration`/`stop_hook_summary` are pure metrics, and
                     // everything else (`permission-mode`/`mode`/`last-prompt`,
                     // covered by top-level `type` values other than `system` and
@@ -574,11 +574,17 @@ fn scan_claude_with_callback_with_exclusions(
                         (None, None) => None,
                     };
 
-                    let base_extra = if compact_message_extra {
+                    let projected_extra = if compact_message_extra {
                         ClaudeCodeConnector::compact_message_extra(&val)
                     } else {
                         val.clone()
                     };
+                    let raw_role = if is_system_away_summary {
+                        "system"
+                    } else {
+                        role_hint.or(entry_type).unwrap_or("agent")
+                    };
+                    let base_extra = add_raw_role(&val, projected_extra, raw_role)?;
 
                     if is_system_away_summary {
                         let content_str =
@@ -587,7 +593,7 @@ fn scan_claude_with_callback_with_exclusions(
                         if !content_str.trim().is_empty() {
                             messages.push(NormalizedMessage {
                                 idx: 0,
-                                role: "system".to_string(),
+                                role: "assistant".to_string(),
                                 author: None,
                                 created_at: created,
                                 content: content_str,
@@ -693,14 +699,10 @@ fn scan_claude_with_callback_with_exclusions(
                                                 content.as_ref(),
                                             );
                                         let mut extra = base_extra.clone();
-                                        if let (Value::Object(map), Some(call_id)) =
-                                            (&mut extra, &tool_use_id)
-                                        {
-                                            map.insert(
-                                                "tool_call_id".to_string(),
-                                                Value::String(call_id.clone()),
-                                            );
-                                        }
+                                        set_tool_result_pairing(
+                                            &mut extra,
+                                            tool_use_id.as_deref(),
+                                        )?;
                                         messages.push(NormalizedMessage {
                                             idx: 0,
                                             role: "tool_result".to_string(),
@@ -965,6 +967,34 @@ mod tests {
         let claude_dir = base.join(".claude");
         fs::create_dir_all(claude_dir.join("projects")).unwrap();
         claude_dir
+    }
+
+    fn scan_explicit_file(path: &Path) -> Result<Vec<NormalizedConversation>> {
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::with_roots(
+            path.parent().unwrap().to_path_buf(),
+            vec![ScanRoot::local(path.to_path_buf())],
+            None,
+        );
+        connector.scan(&ctx)
+    }
+
+    fn normalized_fields(conversation: &NormalizedConversation) -> Vec<Value> {
+        conversation
+            .messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "role": message.role,
+                    "content": message.content,
+                    "author": message.author,
+                    "raw_role": message.extra.get("raw_role"),
+                    "tool_call_id": message.extra.get("tool_call_id"),
+                    "tool_call_args": message.extra.get("tool_call_args"),
+                    "unpaired": message.extra.get("unpaired"),
+                })
+            })
+            .collect()
     }
 
     // =========================================================================
@@ -1624,13 +1654,13 @@ mod tests {
     }
 
     #[test]
-    fn scan_claude_system_away_summary_becomes_system_message() {
+    fn scan_claude_away_summary_becomes_assistant_with_system_raw_role() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
 
         let session_file = claude_dir.join("session.jsonl");
         let content = concat!(
-            r#"{"type":"system","subtype":"away_summary","timestamp":"2026-01-01T00:00:00Z","content":"Syncing your vault. Two git pulls done."}"#,
+            r#"{"type":"system","subtype":"away_summary","timestamp":"2026-01-01T00:00:00Z","content":"Synthetic away summary."}"#,
             "\n",
             r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
             "\n",
@@ -1642,13 +1672,15 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
-        let system_msg = convs[0]
+        let away_summary = convs[0]
             .messages
             .iter()
-            .find(|m| m.role == "system")
-            .expect("away_summary should produce a system message");
-        assert!(system_msg.content.contains("Syncing your vault"));
-        assert!(system_msg.author.is_none());
+            .find(|m| m.content == "Synthetic away summary.")
+            .expect("away_summary should produce a retained message");
+        assert_eq!(away_summary.role, "assistant");
+        assert_eq!(away_summary.extra["raw_role"], "system");
+        assert!(away_summary.author.is_none());
+        assert_eq!(away_summary.created_at, Some(1_767_225_600_000));
     }
 
     #[test]
@@ -1682,6 +1714,215 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].role, "user");
+    }
+
+    #[test]
+    fn scan_claude_sets_envelope_raw_role_on_every_split_block() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        let content = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"assistant prose"},{"type":"tool_use","id":"synthetic-call","name":"Read","input":{"path":"/tmp/synthetic.txt"}},{"type":"thinking","thinking":"synthetic reasoning"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"user prose"},{"type":"tool_result","tool_use_id":"synthetic-call","content":"synthetic result"}]}}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+        let messages = &convs[0].messages;
+
+        assert_eq!(messages.len(), 5);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.extra.get("raw_role").is_some()),
+            "every retained split block must carry raw_role"
+        );
+        assert!(messages.iter().all(|message| {
+            let expected = match message.role.as_str() {
+                "assistant" | "tool_call" | "reasoning" => "assistant",
+                "user" | "tool_result" => "user",
+                role => panic!("unexpected normalized role: {role}"),
+            };
+            message.extra["raw_role"] == expected
+        }));
+        assert!(
+            messages
+                .iter()
+                .enumerate()
+                .all(|(idx, message)| message.idx as usize == idx)
+        );
+    }
+
+    #[test]
+    fn scan_claude_tool_result_without_id_is_explicitly_unpaired() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":""}]}}"#,
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+        let result = &convs[0].messages[0];
+
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(result.role, "tool_result");
+        assert_eq!(result.content, "");
+        assert_eq!(result.extra["raw_role"], "user");
+        assert_eq!(result.extra["unpaired"], true);
+        assert!(result.extra.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn scan_claude_compact_and_noncompact_normalized_fields_match() {
+        let dir = TempDir::new().unwrap();
+        let small_path = dir.path().join("small.jsonl");
+        let compact_path = dir.path().join("compact.jsonl");
+        let assistant = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "synthetic-model",
+                "content": [
+                    {"type": "text", "text": "synthetic prose"},
+                    {
+                        "type": "tool_use",
+                        "id": "synthetic-call",
+                        "name": "Read",
+                        "input": {"path": "/tmp/synthetic.txt", "limit": 123}
+                    },
+                    {"type": "thinking", "thinking": "synthetic complete reasoning"}
+                ]
+            }
+        });
+        let user = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "synthetic-call", "content": ""},
+                    {"type": "tool_result", "content": "synthetic unpaired result"}
+                ]
+            }
+        });
+        fs::write(&small_path, format!("{}\n{}\n", assistant, user)).unwrap();
+
+        let mut padded_assistant = assistant;
+        padded_assistant["padding"] =
+            Value::String("p".repeat(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES as usize + 1024));
+        fs::write(&compact_path, format!("{}\n{}\n", padded_assistant, user)).unwrap();
+        let compact_len = fs::metadata(&compact_path).unwrap().len();
+        assert!(compact_len >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES);
+        assert!(compact_len < 100 * 1024 * 1024);
+
+        let small = scan_explicit_file(&small_path).unwrap();
+        let compact = scan_explicit_file(&compact_path).unwrap();
+        assert_eq!(normalized_fields(&small[0]), normalized_fields(&compact[0]));
+
+        for message in &compact[0].messages {
+            assert!(message.extra.get("padding").is_none());
+            assert!(message.extra.get("message").is_none());
+            assert!(message.extra.get("type").is_none());
+            assert!(message.extra.get("raw_role").is_some());
+        }
+        let paired_empty = compact[0]
+            .messages
+            .iter()
+            .find(|message| message.role == "tool_result" && message.content.is_empty())
+            .expect("empty paired tool result must survive compact parsing");
+        assert_eq!(paired_empty.extra["tool_call_id"], "synthetic-call");
+        assert!(paired_empty.extra.get("unpaired").is_none());
+        let unpaired = compact[0]
+            .messages
+            .iter()
+            .find(|message| message.extra.get("unpaired") == Some(&json!(true)))
+            .expect("missing-id tool result must be retained and marked unpaired");
+        assert_eq!(unpaired.content, "synthetic unpaired result");
+    }
+
+    #[test]
+    fn scan_claude_compact_path_rejects_raw_envelope_raw_role_collision() {
+        let dir = TempDir::new().unwrap();
+        let session_path = dir.path().join("collision.jsonl");
+        let envelope = json!({
+            "type": "user",
+            "raw_role": "collision",
+            "padding": "p".repeat(
+                LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES as usize + 1024
+            ),
+            "message": {"role": "user", "content": "synthetic collision"}
+        });
+        fs::write(&session_path, format!("{envelope}\n")).unwrap();
+        assert!(
+            fs::metadata(&session_path).unwrap().len()
+                >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES
+        );
+
+        let error = scan_explicit_file(&session_path).unwrap_err();
+        assert!(error.to_string().contains("raw_role"));
+    }
+
+    #[test]
+    fn scan_claude_legacy_whole_file_formats_keep_literal_normalized_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let raw = json!({
+            "title": "Synthetic legacy session",
+            "messages": [
+                {"role": "user", "content": "legacy user"},
+                {"role": "assistant", "content": "legacy assistant"}
+            ]
+        });
+
+        for extension in ["json", "claude"] {
+            let session_path = dir.path().join(format!("session.{extension}"));
+            fs::write(&session_path, raw.to_string()).unwrap();
+            let convs = scan_explicit_file(&session_path).unwrap();
+            let snapshot: Vec<Value> = convs[0]
+                .messages
+                .iter()
+                .map(|message| {
+                    json!({
+                        "idx": message.idx,
+                        "role": message.role,
+                        "author": message.author,
+                        "created_at": message.created_at,
+                        "content": message.content,
+                        "extra": message.extra,
+                    })
+                })
+                .collect();
+
+            assert_eq!(
+                snapshot,
+                vec![
+                    json!({
+                        "idx": 0,
+                        "role": "user",
+                        "author": null,
+                        "created_at": null,
+                        "content": "legacy user",
+                        "extra": {"role": "user", "content": "legacy user"},
+                    }),
+                    json!({
+                        "idx": 1,
+                        "role": "assistant",
+                        "author": null,
+                        "created_at": null,
+                        "content": "legacy assistant",
+                        "extra": {"role": "assistant", "content": "legacy assistant"},
+                    }),
+                ],
+                "{extension} whole-file normalized output changed"
+            );
+        }
     }
 
     // =========================================================================
