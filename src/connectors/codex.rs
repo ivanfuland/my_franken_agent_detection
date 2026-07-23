@@ -380,6 +380,23 @@ impl CodexConnector {
         }
     }
 
+    fn normalized_message_extra(
+        raw_envelope: &Value,
+        compact_message_extra: bool,
+        raw_role: &str,
+    ) -> Result<Value> {
+        if raw_envelope.get("encrypted_content").is_some() {
+            anyhow::bail!("raw envelope already contains reserved key encrypted_content");
+        }
+
+        let projected_extra = if compact_message_extra {
+            Self::compact_message_extra(raw_envelope)
+        } else {
+            raw_envelope.clone()
+        };
+        add_raw_role(raw_envelope, projected_extra, raw_role)
+    }
+
     fn attach_token_usage_to_latest_assistant(
         messages: &mut [NormalizedMessage],
         token_usage: Value,
@@ -761,12 +778,11 @@ fn scan_codex_with_callback(
                                     if content.trim().is_empty() {
                                         continue;
                                     }
-                                    let base_extra = if compact_message_extra {
-                                        CodexConnector::compact_message_extra(&val)
-                                    } else {
-                                        val.clone()
-                                    };
-                                    let extra = add_raw_role(&val, base_extra, role)?;
+                                    let extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        role,
+                                    )?;
                                     let invocations = payload.get("content").map_or_else(
                                         Vec::new,
                                         extract_invocations_from_content_blocks,
@@ -804,13 +820,11 @@ fn scan_codex_with_callback(
                                         }
                                         continue;
                                     }
-                                    let base_extra = if compact_message_extra {
-                                        CodexConnector::compact_message_extra(&val)
-                                    } else {
-                                        val.clone()
-                                    };
-                                    let mut extra =
-                                        add_raw_role(&val, base_extra, "agent_message")?;
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "agent_message",
+                                    )?;
                                     if let Some(encrypted_content) = encrypted_content.as_ref() {
                                         add_encrypted_content(&val, &mut extra, encrypted_content)?;
                                     }
@@ -832,12 +846,11 @@ fn scan_codex_with_callback(
                                     if content.trim().is_empty() && encrypted_content.is_none() {
                                         continue;
                                     }
-                                    let base_extra = if compact_message_extra {
-                                        CodexConnector::compact_message_extra(&val)
-                                    } else {
-                                        val.clone()
-                                    };
-                                    let mut extra = add_raw_role(&val, base_extra, "reasoning")?;
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "reasoning",
+                                    )?;
                                     if let Some(encrypted_content) = encrypted_content {
                                         add_encrypted_content(&val, &mut extra, encrypted_content)?;
                                     }
@@ -867,12 +880,11 @@ fn scan_codex_with_callback(
                                         .map(String::from);
                                     let content =
                                         render_tool_call_content(&tool_name, arguments.as_ref());
-                                    let base_extra = if compact_message_extra {
-                                        CodexConnector::compact_message_extra(&val)
-                                    } else {
-                                        val.clone()
-                                    };
-                                    let mut extra = add_raw_role(&val, base_extra, raw_role)?;
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        raw_role,
+                                    )?;
                                     let extra_object = extra
                                         .as_object_mut()
                                         .context("codex tool-call extra must be an object")?;
@@ -912,12 +924,11 @@ fn scan_codex_with_callback(
                                         .get("call_id")
                                         .and_then(Value::as_str)
                                         .map(String::from);
-                                    let base_extra = if compact_message_extra {
-                                        CodexConnector::compact_message_extra(&val)
-                                    } else {
-                                        val.clone()
-                                    };
-                                    let mut extra = add_raw_role(&val, base_extra, raw_role)?;
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        raw_role,
+                                    )?;
                                     set_tool_result_pairing(&mut extra, call_id.as_deref())?;
                                     update_time_bounds(&mut started_at, &mut ended_at, created);
                                     messages.push(NormalizedMessage {
@@ -953,12 +964,11 @@ fn scan_codex_with_callback(
                                     if text.trim().is_empty() {
                                         continue;
                                     }
-                                    let base_extra = if compact_message_extra {
-                                        CodexConnector::compact_message_extra(&val)
-                                    } else {
-                                        val.clone()
-                                    };
-                                    let extra = add_raw_role(&val, base_extra, "user_message")?;
+                                    let extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "user_message",
+                                    )?;
                                     update_time_bounds(&mut started_at, &mut ended_at, created);
                                     messages.push(NormalizedMessage {
                                         idx: 0,
@@ -977,12 +987,11 @@ fn scan_codex_with_callback(
                                     if text.trim().is_empty() {
                                         continue;
                                     }
-                                    let base_extra = if compact_message_extra {
-                                        CodexConnector::compact_message_extra(&val)
-                                    } else {
-                                        val.clone()
-                                    };
-                                    let extra = add_raw_role(&val, base_extra, "agent_reasoning")?;
+                                    let extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "agent_reasoning",
+                                    )?;
                                     update_time_bounds(&mut started_at, &mut ended_at, created);
                                     messages.push(NormalizedMessage {
                                         idx: 0,
@@ -1012,12 +1021,11 @@ fn scan_codex_with_callback(
                                         .map(String::from);
                                     let content =
                                         render_tool_call_content(&tool_name, arguments.as_ref());
-                                    let base_extra = if compact_message_extra {
-                                        CodexConnector::compact_message_extra(&val)
-                                    } else {
-                                        val.clone()
-                                    };
-                                    let mut extra = add_raw_role(&val, base_extra, "tool_call")?;
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "tool_call",
+                                    )?;
                                     let extra_object = extra
                                         .as_object_mut()
                                         .context("codex event tool-call extra must be an object")?;
@@ -2928,6 +2936,140 @@ not valid json at all
     }
 
     #[test]
+    fn scan_codex_visible_agent_message_rejects_top_level_encrypted_content_collision() {
+        let collision_value = "must-not-appear-in-errors-small-agent";
+        let content = format!(
+            r#"{{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"{collision_value}","payload":{{"type":"agent_message","content":[{{"type":"text","text":"visible agent"}}]}}}}"#
+        );
+
+        let error = scan_synthetic_jsonl(&content).unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"), "{error:#}");
+        assert!(!error.to_string().contains(collision_value), "{error:#}");
+    }
+
+    #[test]
+    fn scan_codex_visible_reasoning_rejects_top_level_encrypted_content_collision() {
+        let collision_value = "must-not-appear-in-errors-reasoning";
+        let content = format!(
+            r#"{{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"{collision_value}","payload":{{"type":"reasoning","summary":[{{"type":"summary_text","text":"visible reasoning"}}]}}}}"#
+        );
+
+        let error = scan_synthetic_jsonl(&content).unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"), "{error:#}");
+        assert!(!error.to_string().contains(collision_value), "{error:#}");
+    }
+
+    #[test]
+    fn scan_codex_visible_agent_and_reasoning_without_collision_are_retained() {
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{"type":"text","text":"visible agent"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"visible reasoning"}]}}"#,
+            "\n",
+        );
+
+        let convs = scan_synthetic_jsonl(content).unwrap();
+        let messages = &convs[0].messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            (
+                messages[0].role.as_str(),
+                messages[0].content.as_str(),
+                messages[0].extra["raw_role"].as_str()
+            ),
+            ("user", "visible agent", Some("agent_message"))
+        );
+        assert_eq!(
+            (
+                messages[1].role.as_str(),
+                messages[1].content.as_str(),
+                messages[1].extra["raw_role"].as_str()
+            ),
+            ("reasoning", "visible reasoning", Some("reasoning"))
+        );
+    }
+
+    #[test]
+    fn scan_codex_all_modern_retained_branches_reject_top_level_encrypted_content_collision() {
+        let collision_value = "must-not-appear-in-retained-branch-errors";
+        let cases = [
+            (
+                "response user message",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"message","role":"user","content":"visible user"}}"#,
+            ),
+            (
+                "response assistant message",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"message","role":"assistant","content":"visible assistant"}}"#,
+            ),
+            (
+                "response agent message",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"agent_message","content":[{"type":"text","text":"visible agent"}]}}"#,
+            ),
+            (
+                "response reasoning",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"visible reasoning"}]}}"#,
+            ),
+            (
+                "response function call",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-1"}}"#,
+            ),
+            (
+                "response custom tool call",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"custom_tool_call","name":"apply_patch","input":"patch","call_id":"call-2"}}"#,
+            ),
+            (
+                "response function output",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"function_call_output","call_id":"call-1","output":"result"}}"#,
+            ),
+            (
+                "response custom tool output",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"custom_tool_call_output","call_id":"call-2","output":"result"}}"#,
+            ),
+            (
+                "event user message",
+                r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"user_message","message":"visible event user"}}"#,
+            ),
+            (
+                "event agent reasoning",
+                r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"agent_reasoning","text":"visible event reasoning"}}"#,
+            ),
+            (
+                "event tool call",
+                r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"tool_call","name":"event_tool","input":{"value":1},"call_id":"event-call"}}"#,
+            ),
+        ];
+
+        let violations = cases
+            .into_iter()
+            .filter_map(|(case, content)| match scan_synthetic_jsonl(content) {
+                Err(error)
+                    if error.to_string().contains("encrypted_content")
+                        && !error.to_string().contains(collision_value) =>
+                {
+                    None
+                }
+                Err(error) => Some(format!("{case}: wrong error: {error:#}")),
+                Ok(_) => Some(format!("{case}: unexpectedly accepted")),
+            })
+            .collect::<Vec<_>>();
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn scan_codex_dropped_agent_messages_without_semantic_opaque_ignore_top_level_name() {
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"not-normalized","payload":{"type":"agent_message","content":[{"type":"text","text":"  \n\t  "}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:01Z","encrypted_content":"not-normalized","payload":{"type":"agent_message","content":[{"type":"input_image","image_url":"synthetic://image"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:02Z","encrypted_content":"not-normalized","payload":{"type":"agent_message","content":[{"type":"refusal","refusal":"synthetic refusal"}]}}"#,
+            "\n",
+        );
+
+        assert!(scan_synthetic_jsonl(content).unwrap().is_empty());
+    }
+
+    #[test]
     fn scan_codex_review_present_non_string_response_item_type_fails_closed() {
         let violations = [("null", "null"), ("number", "7")]
             .into_iter()
@@ -3429,6 +3571,67 @@ not valid json at all
             .scan(&ScanContext::local_default(codex_dir, None))
             .unwrap_err();
         assert!(error.to_string().contains("raw_role"));
+    }
+
+    #[test]
+    fn scan_codex_compact_visible_agent_rejects_top_level_encrypted_content_collision() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let collision_value = "must-not-appear-in-errors-compact-agent";
+        let record = json!({
+            "type": "response_item",
+            "timestamp": "2026-07-23T00:00:00Z",
+            "encrypted_content": collision_value,
+            "padding": "x".repeat(32 * 1024 * 1024),
+            "payload": {
+                "type": "agent_message",
+                "content": [{"type": "text", "text": "visible agent"}]
+            }
+        });
+        fs::write(
+            sessions.join("rollout-compact-encrypted-collision.jsonl"),
+            record.to_string() + "\n",
+        )
+        .unwrap();
+
+        let error = CodexConnector::new()
+            .scan(&ScanContext::local_default(codex_dir, None))
+            .unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"), "{error:#}");
+        assert!(!error.to_string().contains(collision_value), "{error:#}");
+    }
+
+    #[test]
+    fn scan_codex_compact_plain_message_rejects_top_level_encrypted_content_collision() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let collision_value = "must-not-appear-in-errors-compact-plain-message";
+        let record = json!({
+            "type": "response_item",
+            "timestamp": "2026-07-23T00:00:00Z",
+            "encrypted_content": collision_value,
+            "padding": "x".repeat(32 * 1024 * 1024),
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": "visible user"
+            }
+        });
+        fs::write(
+            sessions.join("rollout-compact-plain-encrypted-collision.jsonl"),
+            record.to_string() + "\n",
+        )
+        .unwrap();
+
+        let error = CodexConnector::new()
+            .scan(&ScanContext::local_default(codex_dir, None))
+            .unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"), "{error:#}");
+        assert!(!error.to_string().contains(collision_value), "{error:#}");
     }
 
     #[test]
