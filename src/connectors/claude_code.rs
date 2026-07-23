@@ -538,14 +538,16 @@ fn scan_claude_with_callback_with_exclusions(
                     }
 
                     let entry_type = val.get("type").and_then(|v| v.as_str());
-                    let role_hint = val
-                        .get("message")
-                        .and_then(|m| m.get("role"))
-                        .and_then(|v| v.as_str())
-                        .or_else(|| val.get("role").and_then(|v| v.as_str()));
-                    let is_user_assistant = matches!(entry_type, Some("user" | "assistant"))
-                        || (entry_type == Some("message")
-                            && matches!(role_hint, Some("user" | "assistant")));
+                    let inner_role = val.get("message").and_then(|message| message.get("role"));
+                    let message_role = match (entry_type, inner_role) {
+                        (Some("user" | "assistant" | "message"), Some(Value::String(role)))
+                            if matches!(role.as_str(), "user" | "assistant") =>
+                        {
+                            Some(role.as_str())
+                        }
+                        (Some(role @ ("user" | "assistant")), None) => Some(role),
+                        _ => None,
+                    };
                     // Claude `system` records carry several subtypes (spec §3.3,
                     // P1-2): `away_summary` has real content and becomes an
                     // `assistant` message while retaining `raw_role=system`;
@@ -556,9 +558,14 @@ fn scan_claude_with_callback_with_exclusions(
                     // dropped explicitly rather than silently mis-typed.
                     let is_system_away_summary = entry_type == Some("system")
                         && val.get("subtype").and_then(|v| v.as_str()) == Some("away_summary");
-                    if !is_user_assistant && !is_system_away_summary {
+                    let raw_role = if is_system_away_summary {
+                        Some("system")
+                    } else {
+                        message_role
+                    };
+                    let Some(raw_role) = raw_role else {
                         continue;
-                    }
+                    };
 
                     let created = val.get("timestamp").and_then(parse_timestamp);
 
@@ -578,11 +585,6 @@ fn scan_claude_with_callback_with_exclusions(
                         ClaudeCodeConnector::compact_message_extra(&val)
                     } else {
                         val.clone()
-                    };
-                    let raw_role = if is_system_away_summary {
-                        "system"
-                    } else {
-                        role_hint.or(entry_type).unwrap_or("agent")
                     };
                     let base_extra = add_raw_role(&val, projected_extra, raw_role)?;
 
@@ -605,16 +607,19 @@ fn scan_claude_with_callback_with_exclusions(
                         continue;
                     }
 
-                    let role = role_hint.or(entry_type).unwrap_or("agent");
+                    let role = raw_role;
                     let content_val = val
                         .get("message")
                         .and_then(|m| m.get("content"))
                         .or_else(|| val.get("content"));
-                    let author = val
-                        .get("message")
-                        .and_then(|m| m.get("model"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
+                    let author = if role == "assistant" {
+                        val.get("message")
+                            .and_then(|m| m.get("model"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    } else {
+                        None
+                    };
 
                     match content_val {
                         Some(Value::Array(_)) => {
@@ -653,6 +658,9 @@ fn scan_claude_with_callback_with_exclusions(
                                 match block {
                                     TypedBlock::Text(_) => {}
                                     TypedBlock::ToolCall { name, input, id } => {
+                                        if role != "assistant" {
+                                            continue;
+                                        }
                                         let content = ClaudeCodeConnector::render_tool_call_content(
                                             &name,
                                             input.as_ref(),
@@ -694,6 +702,9 @@ fn scan_claude_with_callback_with_exclusions(
                                         content,
                                         tool_use_id,
                                     } => {
+                                        if role != "user" {
+                                            continue;
+                                        }
                                         let content_str =
                                             ClaudeCodeConnector::render_tool_result_content(
                                                 content.as_ref(),
@@ -715,6 +726,9 @@ fn scan_claude_with_callback_with_exclusions(
                                         });
                                     }
                                     TypedBlock::Thinking(text) => {
+                                        if role != "assistant" {
+                                            continue;
+                                        }
                                         messages.push(NormalizedMessage {
                                             idx: 0,
                                             role: "reasoning".to_string(),
@@ -1420,21 +1434,52 @@ mod tests {
     }
 
     #[test]
-    fn scan_extracts_model_as_author() {
+    fn scan_extracts_model_as_author_only_for_assistant_envelopes() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
 
         let session_file = claude_dir.join("session.jsonl");
-        let content = r#"{"type":"assistant","message":{"role":"assistant","content":"Response","model":"claude-3-opus"}}"#;
+        let content = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":"Response","model":"claude-3-opus"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","model":"spoofed-user-model","content":[{"type":"text","text":"Question"},{"type":"tool_result","tool_use_id":"toolu_user_result","content":"Result"}]}}"#,
+            "\n",
+        );
         fs::write(&session_file, content).unwrap();
 
         let connector = ClaudeCodeConnector::new();
         let ctx = ScanContext::local_default(claude_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
+        let assistant = convs[0]
+            .messages
+            .iter()
+            .find(|message| message.content == "Response")
+            .expect("assistant message");
         assert_eq!(
-            convs[0].messages[0].author,
-            Some("claude-3-opus".to_string())
+            assistant.author.as_deref(),
+            Some("claude-3-opus"),
+            "assistant envelopes retain their real model as author"
+        );
+
+        let user = convs[0]
+            .messages
+            .iter()
+            .find(|message| message.content == "Question")
+            .expect("user prose message");
+        assert!(
+            user.author.is_none(),
+            "user envelopes never expose message.model as author"
+        );
+
+        let tool_result = convs[0]
+            .messages
+            .iter()
+            .find(|message| message.role == "tool_result")
+            .expect("user-carried tool result");
+        assert!(
+            tool_result.author.is_none(),
+            "tool_result author remains empty even when its user envelope has a model"
         );
     }
 
@@ -1525,6 +1570,139 @@ mod tests {
 
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].role, "user");
+    }
+
+    #[test]
+    fn scan_claude_inner_role_is_authoritative_and_strictly_whitelisted() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"retained neighbor"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"developer","content":"drop inner developer"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"not-a-role","content":"drop inner unknown"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":7,"content":"drop inner nonstring"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"assistant","content":"inner assistant wins"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"outer user fallback"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":"outer assistant fallback"}}"#,
+            "\n",
+            r#"{"type":"message","role":"user","message":{"content":"drop top-level role fallback"}}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let convs = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1, "retained neighbor prevents a vacuous scan");
+        let emitted = convs[0]
+            .messages
+            .iter()
+            .map(|message| {
+                (
+                    message.content.as_str(),
+                    message.role.as_str(),
+                    message.extra["raw_role"].as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted,
+            vec![
+                ("retained neighbor", "user", Some("user")),
+                ("inner assistant wins", "assistant", Some("assistant")),
+                ("outer user fallback", "user", Some("user")),
+                ("outer assistant fallback", "assistant", Some("assistant")),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_claude_user_envelope_drops_tool_use_but_retains_prose() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"retained user prose"},{"type":"tool_use","id":"wrong-owner-call","name":"WRONG_OWNER_TOOL_CALL_SENTINEL","input":{"value":"WRONG_OWNER_ARGS_SENTINEL"}}]}}"#,
+        )
+        .unwrap();
+
+        let convs = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1, "legal prose prevents a vacuous scan");
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].role, "user");
+        assert_eq!(convs[0].messages[0].content, "retained user prose");
+        assert!(
+            convs[0]
+                .messages
+                .iter()
+                .all(|message| message.role != "tool_call"
+                    && !message.content.contains("WRONG_OWNER_TOOL_CALL_SENTINEL")
+                    && !message.content.contains("WRONG_OWNER_ARGS_SENTINEL"))
+        );
+    }
+
+    #[test]
+    fn scan_claude_assistant_envelope_drops_tool_result_but_retains_prose() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"retained assistant prose"},{"type":"tool_result","tool_use_id":"wrong-owner-result","content":"WRONG_OWNER_TOOL_RESULT_SENTINEL"}]}}"#,
+        )
+        .unwrap();
+
+        let convs = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1, "legal prose prevents a vacuous scan");
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].role, "assistant");
+        assert_eq!(convs[0].messages[0].content, "retained assistant prose");
+        assert!(
+            convs[0]
+                .messages
+                .iter()
+                .all(|message| message.role != "tool_result"
+                    && !message.content.contains("WRONG_OWNER_TOOL_RESULT_SENTINEL"))
+        );
+    }
+
+    #[test]
+    fn scan_claude_user_envelope_drops_thinking_but_retains_prose() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"retained user prose"},{"type":"thinking","thinking":"WRONG_OWNER_THINKING_SENTINEL","signature":"synthetic-signature"}]}}"#,
+        )
+        .unwrap();
+
+        let convs = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1, "legal prose prevents a vacuous scan");
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].role, "user");
+        assert_eq!(convs[0].messages[0].content, "retained user prose");
+        assert!(
+            convs[0]
+                .messages
+                .iter()
+                .all(|message| message.role != "reasoning"
+                    && !message.content.contains("WRONG_OWNER_THINKING_SENTINEL"))
+        );
     }
 
     #[test]

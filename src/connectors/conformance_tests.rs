@@ -863,6 +863,14 @@ mod conformance {
                     .and_then(Value::as_str)
                     .expect("every emitted message must carry string raw_role");
                 assert!(!raw_role.trim().is_empty(), "raw_role must be nonblank");
+                assert!(
+                    matches!(
+                        message.role.as_str(),
+                        "user" | "assistant" | "system" | "tool_call" | "tool_result" | "reasoning"
+                    ),
+                    "non-canonical role emitted: {}",
+                    message.role
+                );
                 let expected_idx = i64::try_from(index).expect("message index must fit in i64");
                 assert_eq!(message.idx, expected_idx, "idx must be exact 0..N");
 
@@ -903,6 +911,7 @@ mod conformance {
         fn claude_code_storage_contract_conformance() {
             const SYSTEM_SENTINEL: &str = "CLAUDE_SYSTEM_DROP_SENTINEL";
             const CONFIG_SENTINEL: &str = "CLAUDE_CONFIG_DROP_SENTINEL";
+            const ROLE_CONFLICT_SENTINEL: &str = "CLAUDE_ROLE_CONFLICT_DROP_SENTINEL";
 
             let tmp = TempDir::new().expect("create Claude fixture root");
             let claude_root = tmp.path().join(".claude");
@@ -949,6 +958,14 @@ mod conformance {
                         }
                     }),
                     json!({
+                        "type": "assistant",
+                        "timestamp": "2026-07-23T00:00:03Z",
+                        "message": {
+                            "role": "developer",
+                            "content": ROLE_CONFLICT_SENTINEL
+                        }
+                    }),
+                    json!({
                         "type": "system",
                         "subtype": "stop_hook_summary",
                         "content": SYSTEM_SENTINEL,
@@ -964,7 +981,10 @@ mod conformance {
             assert_eq!(conversations.len(), 1, "Claude fixture is one conversation");
             let conversation = &conversations[0];
             assert_retained_user_marker(conversation);
-            assert_drop_sentinels_absent(conversation, &[SYSTEM_SENTINEL, CONFIG_SENTINEL]);
+            assert_drop_sentinels_absent(
+                conversation,
+                &[SYSTEM_SENTINEL, CONFIG_SENTINEL, ROLE_CONFLICT_SENTINEL],
+            );
             assert_storage_contract(conversation);
         }
 
