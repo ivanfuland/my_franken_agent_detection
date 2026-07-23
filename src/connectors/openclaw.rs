@@ -368,6 +368,10 @@ impl OpenClawConnector {
         let mut blocks = Vec::new();
         for block in arr {
             let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            // Image payloads are not canonical conversation messages.
+            if block_type == "image" {
+                continue;
+            }
             match block_type {
                 "text" => {
                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -402,8 +406,6 @@ impl OpenClawConnector {
                         blocks.push(OpenClawBlock::Thinking(text.to_string()));
                     }
                 }
-                // Image payloads are not canonical conversation messages.
-                "image" => {}
                 _ => {}
             }
         }
@@ -532,6 +534,19 @@ impl Connector for OpenClawConnector {
                     };
 
                     let line_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if matches!(
+                        line_type,
+                        "model_change"
+                            | "thinking_level_change"
+                            | "custom"
+                            | "response.done"
+                            | "turn.completion_idle_timeout"
+                            | "turn.terminal_idle_timeout"
+                            | "turn.client_closed"
+                    ) {
+                        continue;
+                    }
 
                     match line_type {
                         "session" => {
@@ -795,13 +810,6 @@ impl Connector for OpenClawConnector {
                                 });
                             }
                         }
-                        "model_change"
-                        | "thinking_level_change"
-                        | "custom"
-                        | "response.done"
-                        | "turn.completion_idle_timeout"
-                        | "turn.terminal_idle_timeout"
-                        | "turn.client_closed" => {}
                         // Unknown future wrappers remain unclassifiable. Do
                         // not guess a canonical message mapping for them.
                         _ => {}

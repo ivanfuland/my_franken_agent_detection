@@ -749,9 +749,10 @@ fn scan_codex_with_callback(
                             };
                             match payload_type {
                                 Some("message") | None => {
-                                    let role = match payload.get("role").and_then(Value::as_str) {
-                                        Some(role @ ("user" | "assistant")) => role,
-                                        Some("developer") | Some(_) | None => continue,
+                                    let Some(role @ ("user" | "assistant")) =
+                                        payload.get("role").and_then(Value::as_str)
+                                    else {
+                                        continue;
                                     };
                                     let content = payload
                                         .get("content")
@@ -937,7 +938,13 @@ fn scan_codex_with_callback(
                             let Some(payload) = val.get("payload") else {
                                 continue;
                             };
-                            match payload.get("type").and_then(Value::as_str) {
+                            let event_type = payload.get("type").and_then(Value::as_str);
+                            // Event-layer agent messages duplicate the visible
+                            // response item and are structural noise.
+                            if event_type == Some("agent_message") {
+                                continue;
+                            }
+                            match event_type {
                                 Some("user_message") => {
                                     let text = payload
                                         .get("message")
@@ -1054,7 +1061,6 @@ fn scan_codex_with_callback(
                                         );
                                     }
                                 }
-                                Some("agent_message") => {}
                                 Some(_) | None => {}
                             }
                         }
@@ -2755,6 +2761,7 @@ not valid json at all
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn scan_codex_response_item_and_event_msg_role_matrix() {
         let content = concat!(
             r#"{"type":"session_meta","timestamp":"2026-07-23T00:00:00Z","payload":{"cwd":"/tmp/synthetic-codex"}}"#,
@@ -2896,7 +2903,7 @@ not valid json at all
             conv.messages
                 .iter()
                 .enumerate()
-                .all(|(idx, message)| message.idx == idx as i64)
+                .all(|(idx, message)| i64::try_from(idx) == Ok(message.idx))
         );
     }
 

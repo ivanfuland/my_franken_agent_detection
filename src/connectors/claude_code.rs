@@ -1753,7 +1753,7 @@ mod tests {
             messages
                 .iter()
                 .enumerate()
-                .all(|(idx, message)| message.idx as usize == idx)
+                .all(|(idx, message)| usize::try_from(message.idx) == Ok(idx))
         );
     }
 
@@ -1816,8 +1816,9 @@ mod tests {
         fs::write(&small_path, format!("{}\n{}\n", assistant, user)).unwrap();
 
         let mut padded_assistant = assistant;
-        padded_assistant["padding"] =
-            Value::String("p".repeat(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES as usize + 1024));
+        let padding_len = usize::try_from(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES + 1024)
+            .expect("compact threshold must fit in usize");
+        padded_assistant["padding"] = Value::String("p".repeat(padding_len));
         fs::write(&compact_path, format!("{}\n{}\n", padded_assistant, user)).unwrap();
         let compact_len = fs::metadata(&compact_path).unwrap().len();
         assert!(compact_len >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES);
@@ -1852,12 +1853,12 @@ mod tests {
     fn scan_claude_compact_path_rejects_raw_envelope_raw_role_collision() {
         let dir = TempDir::new().unwrap();
         let session_path = dir.path().join("collision.jsonl");
+        let padding_len = usize::try_from(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES + 1024)
+            .expect("compact threshold must fit in usize");
         let envelope = json!({
             "type": "user",
             "raw_role": "collision",
-            "padding": "p".repeat(
-                LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES as usize + 1024
-            ),
+            "padding": "p".repeat(padding_len),
             "message": {"role": "user", "content": "synthetic collision"}
         });
         fs::write(&session_path, format!("{envelope}\n")).unwrap();

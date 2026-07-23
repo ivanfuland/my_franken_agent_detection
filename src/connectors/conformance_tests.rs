@@ -863,7 +863,8 @@ mod conformance {
                     .and_then(Value::as_str)
                     .expect("every emitted message must carry string raw_role");
                 assert!(!raw_role.trim().is_empty(), "raw_role must be nonblank");
-                assert_eq!(message.idx, index as i64, "idx must be exact 0..N");
+                let expected_idx = i64::try_from(index).expect("message index must fit in i64");
+                assert_eq!(message.idx, expected_idx, "idx must be exact 0..N");
 
                 if message.role == "tool_result" {
                     let paired = message
