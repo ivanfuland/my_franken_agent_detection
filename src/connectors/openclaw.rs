@@ -16,6 +16,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::{add_raw_role, set_tool_result_pairing};
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -307,15 +308,58 @@ impl OpenClawConnector {
         }
     }
 
-    /// Resolve a `toolResult`'s pairing id from a single JSON object (either
-    /// the top-level `message` or a nested content block): prefer
-    /// `toolCallId`, falling back to `toolUseId`/`tool_use_id`/`id` -- all
-    /// equal to the originating `toolCall`'s id in real `~/.openclaw`
-    /// sessions (spec §3.3 openclaw).
-    fn openclaw_pairing_id_from(v: &Value) -> Option<String> {
-        ["toolCallId", "toolUseId", "tool_use_id", "id"]
-            .iter()
-            .find_map(|key| v.get(*key).and_then(|x| x.as_str()).map(String::from))
+    fn merge_openclaw_pairing_id(
+        resolved: &mut Option<String>,
+        candidate: Option<String>,
+    ) -> Result<()> {
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        match resolved {
+            Some(existing) if existing != &candidate => {
+                anyhow::bail!("OpenClaw tool result pairing identifiers conflict");
+            }
+            Some(_) => {}
+            None => *resolved = Some(candidate),
+        }
+        Ok(())
+    }
+
+    /// Resolve a `toolResult` pairing id from one structural object. All
+    /// non-blank explicit id fields must agree; redundant equal fields are
+    /// accepted, while distinct ids fail without being copied into the error.
+    fn openclaw_pairing_id_from(v: &Value) -> Result<Option<String>> {
+        let mut resolved = None;
+        for key in ["toolCallId", "toolUseId", "tool_use_id", "id"] {
+            let candidate = v
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(String::from);
+            Self::merge_openclaw_pairing_id(&mut resolved, candidate)?;
+        }
+        Ok(resolved)
+    }
+
+    /// Merge the outer top-level `toolResult` message id with ids from only
+    /// typed `toolResult` content blocks. Other block ids belong to other
+    /// structures and must never participate in tool-result pairing.
+    fn openclaw_top_level_tool_result_pairing_id(
+        message: &Value,
+        content: Option<&Value>,
+    ) -> Result<Option<String>> {
+        let mut resolved = Self::openclaw_pairing_id_from(message)?;
+        if let Some(blocks) = content.and_then(Value::as_array) {
+            for block in blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("toolResult"))
+            {
+                let candidate = Self::openclaw_pairing_id_from(block)?;
+                Self::merge_openclaw_pairing_id(&mut resolved, candidate)?;
+            }
+        }
+        Ok(resolved)
     }
 
     /// Extract a single content block's own result body: prefers `content`
@@ -353,14 +397,18 @@ impl OpenClawConnector {
     /// uses its own camelCase block vocabulary (`toolCall`/`toolResult`)
     /// rather than Anthropic's (`tool_use`/`tool_result`), so this doesn't
     /// reuse `split_content_blocks` (task 1.1) verbatim.
-    fn split_openclaw_blocks(content: &Value) -> Vec<OpenClawBlock> {
+    fn split_openclaw_blocks(content: &Value) -> Result<Vec<OpenClawBlock>> {
         let Some(arr) = content.as_array() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let mut blocks = Vec::new();
         for block in arr {
             let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            // Image payloads are not canonical conversation messages.
+            if block_type == "image" {
+                continue;
+            }
             match block_type {
                 "text" => {
                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -386,19 +434,39 @@ impl OpenClawConnector {
                     // (toolResult always arrives as its own top-level
                     // message -- handled separately in `scan`), but the
                     // spec calls for handling both shapes explicitly.
-                    let id = Self::openclaw_pairing_id_from(block);
+                    let id = Self::openclaw_pairing_id_from(block)?;
                     let text = Self::openclaw_block_body(block).unwrap_or_default();
                     blocks.push(OpenClawBlock::ToolResult { text, id });
                 }
                 "thinking" => {
-                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    // Real OpenClaw sessions carry the reasoning in `thinking`
+                    // (alongside a `thinkingSignature`), not in `text`. Reading
+                    // only `text` dropped every thinking block ever written --
+                    // measured across 300 live sessions: 3713 thinking blocks,
+                    // `thinking` present in all 3713 and `text` in 0 of them.
+                    // Same read as `utils.rs`'s typed-block split: `thinking`
+                    // first, fall back to `text`. An empty-string value still
+                    // yields a block rather than being silently dropped -- 2114
+                    // of those 3713 are signed-but-empty, and empty is a
+                    // definite value, not a missing one.
+                    // The fallback resolves each key to a string before moving
+                    // on, rather than picking the key first and stringifying
+                    // after. `{"thinking":null,"text":"body"}` would otherwise
+                    // emit nothing: `get("thinking")` yields `Some(Null)`, which
+                    // is not `None`, so `or_else` never looks at `text`. Same
+                    // for a non-string `thinking`. Identical form in `utils.rs`.
+                    if let Some(text) = block
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .or_else(|| block.get("text").and_then(|t| t.as_str()))
+                    {
                         blocks.push(OpenClawBlock::Thinking(text.to_string()));
                     }
                 }
                 _ => {}
             }
         }
-        blocks
+        Ok(blocks)
     }
 }
 
@@ -524,6 +592,19 @@ impl Connector for OpenClawConnector {
 
                     let line_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+                    if matches!(
+                        line_type,
+                        "model_change"
+                            | "thinking_level_change"
+                            | "custom"
+                            | "response.done"
+                            | "turn.completion_idle_timeout"
+                            | "turn.terminal_idle_timeout"
+                            | "turn.client_closed"
+                    ) {
+                        continue;
+                    }
+
                     match line_type {
                         "session" => {
                             // Extract session metadata
@@ -538,10 +619,11 @@ impl Connector for OpenClawConnector {
                                 continue;
                             };
 
-                            let raw_role = msg
-                                .get("role")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("assistant");
+                            let Some(raw_role @ ("user" | "assistant" | "toolResult")) =
+                                msg.get("role").and_then(|v| v.as_str())
+                            else {
+                                continue;
+                            };
 
                             // Timestamps can be on the wrapper or inner message
                             let created = val
@@ -563,7 +645,7 @@ impl Connector for OpenClawConnector {
                             let author =
                                 msg.get("model").and_then(|v| v.as_str()).map(String::from);
                             let content = msg.get("content");
-                            let base_extra = val.clone();
+                            let base_extra = add_raw_role(&val, val.clone(), raw_role)?;
 
                             // Top-level `toolResult` messages (role=="toolResult")
                             // carry the whole tool result body directly on the
@@ -586,19 +668,9 @@ impl Connector for OpenClawConnector {
                                     .map(Self::openclaw_tool_result_text)
                                     .unwrap_or_default();
                                 let pairing_id =
-                                    Self::openclaw_pairing_id_from(msg).or_else(|| {
-                                        content
-                                            .and_then(Value::as_array)
-                                            .and_then(|arr| arr.first())
-                                            .and_then(Self::openclaw_pairing_id_from)
-                                    });
+                                    Self::openclaw_top_level_tool_result_pairing_id(msg, content)?;
                                 let mut extra = base_extra;
-                                if let (Value::Object(map), Some(id)) = (&mut extra, &pairing_id) {
-                                    map.insert(
-                                        "tool_call_id".to_string(),
-                                        Value::String(id.clone()),
-                                    );
-                                }
+                                set_tool_result_pairing(&mut extra, pairing_id.as_deref())?;
                                 messages.push(NormalizedMessage {
                                     idx: 0,
                                     role: "tool_result".to_string(),
@@ -627,7 +699,7 @@ impl Connector for OpenClawConnector {
 
                             match content {
                                 Some(Value::Array(_)) => {
-                                    let blocks = Self::split_openclaw_blocks(content.unwrap());
+                                    let blocks = Self::split_openclaw_blocks(content.unwrap())?;
 
                                     let mut prose = String::new();
                                     for block in &blocks {
@@ -704,14 +776,7 @@ impl Connector for OpenClawConnector {
                                                 // still emitted, keeping its
                                                 // pairing id.
                                                 let mut extra = base_extra.clone();
-                                                if let (Value::Object(map), Some(call_id)) =
-                                                    (&mut extra, &id)
-                                                {
-                                                    map.insert(
-                                                        "tool_call_id".to_string(),
-                                                        Value::String(call_id.clone()),
-                                                    );
-                                                }
+                                                set_tool_result_pairing(&mut extra, id.as_deref())?;
                                                 messages.push(NormalizedMessage {
                                                     idx: 0,
                                                     role: "tool_result".to_string(),
@@ -763,9 +828,9 @@ impl Connector for OpenClawConnector {
                             // `compaction` events carry a substantive
                             // multi-paragraph `summary` (a running digest of
                             // the conversation), directly analogous to
-                            // claude's `away_summary`. Spec §3.3: wrapper
-                            // events with SUBSTANTIVE content -> `system` role
-                            // (NOT dropped). Only emit when `summary` is a
+                            // claude's `away_summary`. The normalized role is
+                            // assistant while raw_role preserves compaction.
+                            // Only emit when `summary` is a
                             // non-empty string; an absent/empty summary has no
                             // content -> drop. Routed through the same
                             // `messages` vector so the `reindex_messages` call
@@ -788,27 +853,18 @@ impl Connector for OpenClawConnector {
                                 };
                                 messages.push(NormalizedMessage {
                                     idx: 0,
-                                    role: "system".to_string(),
+                                    role: "assistant".to_string(),
                                     author: None,
                                     created_at: created,
                                     content: summary.to_string(),
-                                    extra: val,
+                                    extra: add_raw_role(&val, val.clone(), "compaction")?,
                                     invocations: Vec::new(),
                                     snippets: Vec::new(),
                                 });
                             }
                         }
-                        // Skip model_change, thinking_level_change, custom, etc.
-                        // Verified against real ~/.openclaw sessions (scan of
-                        // ~200 files): `session`/`thinking_level_change`/
-                        // `model_change` carry only metadata (cwd/id,
-                        // thinking-level string, provider/modelId); `custom`
-                        // entries in this fork are all `customType:
-                        // "model-snapshot"` (provider/modelId metadata). None
-                        // of these carries substantive user-facing content, so
-                        // dropping them is correct. (`compaction` DOES carry
-                        // substantive prose and is handled above as `system`,
-                        // like claude's `away_summary`.)
+                        // Unknown future wrappers remain unclassifiable. Do
+                        // not guess a canonical message mapping for them.
                         _ => {}
                     }
                 }
@@ -986,6 +1042,468 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn scan_openclaw_requires_an_explicit_whitelisted_message_role() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"valid","message":{"role":"user","content":"kept"}}"#,
+                r#"{"type":"message","id":"missing","message":{"content":"must not default to assistant"}}"#,
+                r#"{"type":"message","id":"unknown","message":{"role":"system","content":"must not pass through"}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].role, "user");
+        assert_eq!(convs[0].messages[0].content, "kept");
+    }
+
+    #[test]
+    fn scan_openclaw_copies_envelope_raw_role_to_every_retained_block() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"ask"}]}}"#,
+                r#"{"type":"message","id":"m2","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"answer"},{"type":"toolCall","id":"call_1","name":"read","arguments":{"path":"fixture.txt"}},{"type":"thinking","thinking":"inspect first","thinkingSignature":"sig-1"},{"type":"toolResult","toolCallId":"call_1","content":""}]}}"#,
+                r#"{"type":"message","id":"m3","message":{"role":"toolResult","toolCallId":"call_1","content":[]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let messages = &convs[0].messages;
+        assert_eq!(messages.len(), 6);
+
+        for message in messages {
+            let expected = match message.content.as_str() {
+                "ask" => "user",
+                "" if message.extra["message"]["role"] == "toolResult" => "toolResult",
+                _ => "assistant",
+            };
+            assert_eq!(
+                message.extra["raw_role"].as_str(),
+                Some(expected),
+                "role={} content={:?}",
+                message.role,
+                message.content
+            );
+        }
+
+        let reasoning = messages
+            .iter()
+            .find(|message| message.role == "reasoning")
+            .expect("thinking block");
+        assert_eq!(reasoning.author.as_deref(), Some("synthetic-model"));
+    }
+
+    /// Locks the *real* OpenClaw thinking shape against the implementation.
+    ///
+    /// The shapes here were taken from live sessions, not from reading
+    /// `split_openclaw_blocks`. That distinction is the whole point: the
+    /// implementation, the `utils.rs` comment, two tests and a downstream
+    /// fixture all previously encoded the same wrong belief (`text` carries
+    /// the reasoning), so they agreed with each other and the gate stayed
+    /// green while every thinking block was silently dropped. Measured on
+    /// live sessions: 3713 thinking blocks, `thinking` present in all of
+    /// them, `text` in none.
+    ///
+    /// Both live forms are covered -- signed with a body, and signed with an
+    /// empty body (2114 of the 3713). Empty is a definite value: it must
+    /// still produce a `reasoning` message so the block's position in the
+    /// turn survives, exactly as an empty Claude thinking block does.
+    #[test]
+    fn scan_openclaw_reads_thinking_key_and_keeps_empty_signed_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"ask"}]}}"#,
+                r#"{"type":"message","id":"m2","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"thinking","thinking":"real body","thinkingSignature":"sig-a"},{"type":"thinking","thinking":"","thinkingSignature":"sig-b"}]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let reasoning: Vec<_> = convs[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == "reasoning")
+            .collect();
+
+        assert_eq!(
+            reasoning.len(),
+            2,
+            "both signed thinking blocks must survive, including the empty one"
+        );
+        assert_eq!(reasoning[0].content, "real body");
+        assert_eq!(reasoning[1].content, "");
+        for message in &reasoning {
+            assert_eq!(message.author.as_deref(), Some("synthetic-model"));
+            assert_eq!(message.extra["raw_role"].as_str(), Some("assistant"));
+        }
+    }
+
+    /// The `text` fallback stays supported: `utils.rs` accepts both keys and
+    /// this connector must not diverge from it. Dropping the fallback would
+    /// be a second, opposite version of the same bug.
+    #[test]
+    fn scan_openclaw_still_accepts_legacy_thinking_text_key() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"m1","message":{"role":"assistant","model":"m","content":[{"type":"thinking","text":"legacy body"}]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let reasoning: Vec<_> = convs[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == "reasoning")
+            .collect();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0].content, "legacy body");
+    }
+
+    /// A present-but-unusable `thinking` must fall through to `text`.
+    ///
+    /// The obvious spelling of the fallback picks the key first and stringifies
+    /// after, which swallows this input: `get("thinking")` returns `Some(Null)`,
+    /// `or_else` only fires on `None`, and the later `as_str()` then yields
+    /// `None` — so nothing is emitted even though a perfectly good `text` sits
+    /// right there. Covers null and a non-string value; the previous test only
+    /// covers an absent primary key, which is a different branch.
+    #[test]
+    fn scan_openclaw_thinking_null_or_non_string_falls_through_to_text() {
+        for probe in [
+            r#"{"type":"thinking","thinking":null,"text":"fallback body"}"#,
+            r#"{"type":"thinking","thinking":123,"text":"fallback body"}"#,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            write_session(
+                &sessions,
+                "session.jsonl",
+                &[&format!(
+                    r#"{{"type":"message","id":"m1","message":{{"role":"assistant","model":"m","content":[{probe}]}}}}"#
+                )],
+            );
+
+            let convs = OpenClawConnector::new()
+                .scan(&ScanContext::local_default(sessions, None))
+                .unwrap();
+            let reasoning: Vec<_> = convs[0]
+                .messages
+                .iter()
+                .filter(|message| message.role == "reasoning")
+                .collect();
+            assert_eq!(reasoning.len(), 1, "probe={probe}");
+            assert_eq!(reasoning[0].content, "fallback body", "probe={probe}");
+        }
+    }
+
+    #[test]
+    fn scan_openclaw_tool_results_enforce_paired_unpaired_xor_and_scan_array_ids() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"anchor","message":{"role":"user","content":"anchor"}}"#,
+                r#"{"type":"message","id":"top-paired","message":{"role":"toolResult","content":[{"type":"text","text":"prefix"},{"type":"toolResult","toolCallId":"call_late","content":"paired"}]}}"#,
+                r#"{"type":"message","id":"top-unpaired","message":{"role":"toolResult","content":[]}}"#,
+                r#"{"type":"message","id":"embedded","message":{"role":"assistant","content":[{"type":"toolResult","toolUseId":"embedded_pair","content":""},{"type":"toolResult","content":""}]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let results: Vec<_> = convs[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool_result")
+            .collect();
+        assert_eq!(results.len(), 4, "empty results must remain structural");
+
+        let paired: Vec<_> = results
+            .iter()
+            .filter(|message| message.extra.get("tool_call_id").is_some())
+            .collect();
+        let unpaired: Vec<_> = results
+            .iter()
+            .filter(|message| message.extra.get("unpaired") == Some(&Value::Bool(true)))
+            .collect();
+        assert_eq!(paired.len(), 2);
+        assert_eq!(unpaired.len(), 2);
+        assert!(
+            paired
+                .iter()
+                .all(|message| !message.extra["unpaired"].is_boolean())
+        );
+        assert!(
+            unpaired
+                .iter()
+                .all(|message| message.extra.get("tool_call_id").is_none())
+        );
+        assert!(
+            paired
+                .iter()
+                .any(|message| message.extra["tool_call_id"] == "call_late"),
+            "top-level content arrays must scan beyond the first block for a real id"
+        );
+        assert!(
+            paired
+                .iter()
+                .any(|message| message.extra["tool_call_id"] == "embedded_pair")
+        );
+    }
+
+    #[test]
+    fn scan_openclaw_skips_blank_outer_pairing_id_and_finds_late_content_id() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"anchor","message":{"role":"user","content":"anchor"}}"#,
+                r#"{"type":"message","id":"result","message":{"role":"toolResult","toolCallId":"   ","content":[{"type":"text","text":"prefix"},{"type":"toolResult","toolCallId":" ","toolUseId":"valid_late","content":"paired"}]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let result = convs[0]
+            .messages
+            .iter()
+            .find(|message| message.role == "tool_result")
+            .expect("tool result");
+
+        assert_eq!(result.extra["tool_call_id"], "valid_late");
+        assert!(result.extra.get("unpaired").is_none());
+    }
+
+    #[test]
+    fn scan_openclaw_top_level_tool_result_ignores_ids_on_unrelated_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"anchor","message":{"role":"user","content":"anchor"}}"#,
+                r#"{"type":"message","id":"result","message":{"role":"toolResult","content":[{"type":"text","id":"unrelated-text-id","text":"prefix"},{"type":"toolResult","toolCallId":"real-call","content":"paired"}]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let result = convs[0]
+            .messages
+            .iter()
+            .find(|message| message.role == "tool_result")
+            .expect("tool result");
+
+        assert_eq!(result.extra["tool_call_id"], "real-call");
+        assert_ne!(result.extra["tool_call_id"], "unrelated-text-id");
+        assert!(result.extra.get("unpaired").is_none());
+    }
+
+    #[test]
+    fn scan_openclaw_pairing_conflicts_fail_loud_without_echoing_ids() {
+        let cases = [
+            (
+                "same object",
+                r#"{"type":"message","id":"result","message":{"role":"toolResult","toolCallId":"same-object-a","toolUseId":"same-object-b","content":"result"}}"#,
+                ["same-object-a", "same-object-b"],
+            ),
+            (
+                "outer versus typed block",
+                r#"{"type":"message","id":"result","message":{"role":"toolResult","toolCallId":"outer-a","content":[{"type":"toolResult","toolCallId":"typed-b","content":"result"}]}}"#,
+                ["outer-a", "typed-b"],
+            ),
+            (
+                "multiple typed blocks",
+                r#"{"type":"message","id":"result","message":{"role":"toolResult","content":[{"type":"toolResult","toolCallId":"typed-first","content":"one"},{"type":"toolResult","toolCallId":"typed-second","content":"two"}]}}"#,
+                ["typed-first", "typed-second"],
+            ),
+            (
+                "embedded same object",
+                r#"{"type":"message","id":"result","message":{"role":"assistant","content":[{"type":"toolResult","toolCallId":"embedded-a","tool_use_id":"embedded-b","content":"result"}]}}"#,
+                ["embedded-a", "embedded-b"],
+            ),
+        ];
+
+        let violations = cases
+            .into_iter()
+            .filter_map(|(case, record, forbidden_ids)| {
+                let tmp = TempDir::new().unwrap();
+                let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+                fs::create_dir_all(&sessions).unwrap();
+                write_session(
+                    &sessions,
+                    "session.jsonl",
+                    &[
+                        r#"{"type":"message","id":"anchor","message":{"role":"user","content":"anchor"}}"#,
+                        record,
+                    ],
+                );
+
+                match OpenClawConnector::new()
+                    .scan(&ScanContext::local_default(sessions, None))
+                {
+                    Err(error) => {
+                        let error = error.to_string();
+                        if error.contains("pairing")
+                            && forbidden_ids.iter().all(|id| !error.contains(id))
+                        {
+                            None
+                        } else {
+                            Some(format!("{case}: wrong error: {error}"))
+                        }
+                    }
+                    Ok(_) => Some(format!("{case}: unexpectedly accepted")),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn scan_openclaw_pairing_redundancy_blank_and_missing_ids_remain_valid() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"anchor","message":{"role":"user","content":"anchor"}}"#,
+                r#"{"type":"message","id":"redundant","message":{"role":"toolResult","toolCallId":"same-id","toolUseId":"same-id","content":[{"type":"toolResult","id":"same-id","toolCallId":"same-id","tool_use_id":"same-id","content":"redundant"}]}}"#,
+                r#"{"type":"message","id":"blank","message":{"role":"toolResult","toolCallId":"   ","content":[{"type":"toolResult","toolUseId":"valid-typed","content":"blank outer"}]}}"#,
+                r#"{"type":"message","id":"missing","message":{"role":"toolResult","content":[]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let results = convs[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool_result")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].extra["tool_call_id"], "same-id");
+        assert_eq!(results[1].extra["tool_call_id"], "valid-typed");
+        assert_eq!(results[2].extra["unpaired"], true);
+        assert!(results[2].extra.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn scan_openclaw_explicitly_drops_images_and_control_wrappers_without_idx_holes() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"session","id":"s1","timestamp":"2026-04-01T00:00:00.000Z","cwd":"/synthetic/workspace"}"#,
+                r#"{"type":"message","id":"u1","message":{"role":"user","content":[{"type":"image","mimeType":"image/png","data":"synthetic"},{"type":"text","text":"first"}]}}"#,
+                r#"{"type":"response.done","response":{"id":"r1"}}"#,
+                r#"{"type":"turn.completion_idle_timeout","turn":{"id":"t1"}}"#,
+                r#"{"type":"turn.terminal_idle_timeout","turn":{"id":"t1"}}"#,
+                r#"{"type":"turn.client_closed","turn":{"id":"t1"}}"#,
+                r#"{"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"image","mimeType":"image/png","data":"synthetic"},{"type":"text","text":"second"}]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let conv = &convs[0];
+        assert_eq!(
+            conv.messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(
+            conv.messages
+                .iter()
+                .enumerate()
+                .all(|(idx, message)| usize::try_from(message.idx).unwrap() == idx)
+        );
+        assert_eq!(
+            conv.workspace.as_deref(),
+            Some(Path::new("/synthetic/workspace"))
+        );
+        assert_eq!(conv.metadata["cwd"], "/synthetic/workspace");
+        assert_eq!(conv.started_at, Some(1_775_001_600_000));
+    }
+
+    #[test]
+    fn scan_openclaw_propagates_raw_role_collision_errors() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","raw_role":"collision","message":{"role":"user","content":"must fail loud"}}"#,
+            ],
+        );
+
+        let error = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .expect_err("reserved raw_role collision must propagate through scan");
+        assert!(error.to_string().contains("raw_role"));
+    }
+
+    #[test]
     fn scan_openclaw_splits_content_blocks_into_typed_6role_messages() {
         let tmp = TempDir::new().unwrap();
         let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
@@ -1001,7 +1519,7 @@ mod tests {
         let content = concat!(
             r#"{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"Please check that file"}]}}"#,
             "\n",
-            r#"{"type":"message","id":"m2","timestamp":"2026-03-01T00:00:00.000Z","message":{"role":"assistant","model":"claude-opus-4-6","content":[{"type":"text","text":"Let me check that file."},{"type":"toolCall","id":"call_1","name":"bash","arguments":{"cmd":"cat file.txt"}},{"type":"thinking","text":"I should read the file first."}]}}"#,
+            r#"{"type":"message","id":"m2","timestamp":"2026-03-01T00:00:00.000Z","message":{"role":"assistant","model":"claude-opus-4-6","content":[{"type":"text","text":"Let me check that file."},{"type":"toolCall","id":"call_1","name":"bash","arguments":{"cmd":"cat file.txt"}},{"type":"thinking","thinking":"I should read the file first.","thinkingSignature":"sig-1"}]}}"#,
             "\n",
             r#"{"type":"message","id":"m3","timestamp":"2026-03-01T00:00:01.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"toolResult","id":"call_1","toolCallId":"call_1","toolUseId":"call_1","tool_use_id":"call_1","toolName":"bash","name":"bash","content":"file contents here","text":"file contents here"}]}}"#,
             "\n",
@@ -1215,13 +1733,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_openclaw_compaction_summary_becomes_system_message() {
+    fn scan_openclaw_compaction_summary_becomes_assistant_with_compaction_raw_role() {
         // Real OpenClaw sessions emit `compaction` wrapper events carrying a
         // substantive multi-paragraph `summary` (a running digest of the
         // conversation), directly analogous to claude's `away_summary`.
-        // Spec §3.3: wrapper events with SUBSTANTIVE content -> `system`
-        // role (not dropped). Verified against 41 real compaction events
-        // across ~/.openclaw/agents/*/sessions/*.jsonl.
+        // It becomes assistant while preserving raw_role=compaction.
         let tmp = TempDir::new().unwrap();
         let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
         fs::create_dir_all(&sessions).unwrap();
@@ -1239,21 +1755,22 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
 
-        let system = convs[0]
+        let compaction = convs[0]
             .messages
             .iter()
-            .find(|m| m.role == "system")
-            .expect("compaction summary must become a system message, not be dropped");
+            .find(|m| m.extra.get("raw_role") == Some(&Value::String("compaction".to_string())))
+            .expect("compaction summary must become an assistant message, not be dropped");
         assert_eq!(
-            system.content,
+            compaction.content,
             "## Decisions\n- Kept the plan.\n- Shipped it."
         );
+        assert_eq!(compaction.role, "assistant");
         assert!(
-            system.author.is_none(),
-            "system message from a compaction summary has no model author"
+            compaction.author.is_none(),
+            "assistant message from a compaction summary has no model author"
         );
 
-        // idx stays contiguous 0..N after the compaction system message is
+        // idx stays contiguous 0..N after the compaction assistant message is
         // routed through the same vector as the message(s) (spec §3.4).
         assert!(
             convs[0]
@@ -1267,7 +1784,7 @@ mod tests {
     #[test]
     fn scan_openclaw_compaction_without_summary_is_dropped() {
         // A compaction event with an absent/empty `summary` carries no
-        // substantive content -> drop (no system message).
+        // substantive content -> drop (no compaction message).
         let tmp = TempDir::new().unwrap();
         let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
         fs::create_dir_all(&sessions).unwrap();
@@ -1287,8 +1804,11 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(
-            convs[0].messages.iter().all(|m| m.role != "system"),
-            "empty/absent compaction summary must not emit a system message"
+            convs[0]
+                .messages
+                .iter()
+                .all(|m| m.extra.get("raw_role") != Some(&Value::String("compaction".to_string()))),
+            "empty/absent compaction summary must not emit a compaction message"
         );
         assert_eq!(convs[0].messages.len(), 1);
     }

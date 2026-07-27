@@ -2,6 +2,109 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
+const RAW_ROLE_KEY: &str = "raw_role";
+const TOOL_CALL_ID_KEY: &str = "tool_call_id";
+const UNPAIRED_KEY: &str = "unpaired";
+const ENCRYPTED_CONTENT_KEY: &str = "encrypted_content";
+
+fn object_for_read<'a>(
+    value: &'a Value,
+    field_name: &str,
+) -> anyhow::Result<&'a serde_json::Map<String, Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("{field_name} must be an object"))
+}
+
+fn object_for_write<'a>(
+    value: &'a mut Value,
+    field_name: &str,
+) -> anyhow::Result<&'a mut serde_json::Map<String, Value>> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{field_name} must be an object"))
+}
+
+/// Add the source role to a normalized message's extra fields without losing
+/// collision evidence from the original envelope.
+pub(crate) fn add_raw_role(
+    raw_envelope: &Value,
+    projected_extra: Value,
+    raw_role: &str,
+) -> anyhow::Result<Value> {
+    if raw_role.trim().is_empty() {
+        anyhow::bail!("raw_role must be non-empty");
+    }
+
+    let raw_object = object_for_read(raw_envelope, "raw envelope")?;
+    if raw_object.contains_key(RAW_ROLE_KEY) {
+        anyhow::bail!("raw envelope already contains reserved key {RAW_ROLE_KEY}");
+    }
+
+    let mut projected_extra = projected_extra;
+    let extra_object = object_for_write(&mut projected_extra, "projected extra")?;
+    if extra_object.contains_key(RAW_ROLE_KEY) {
+        anyhow::bail!("projected extra already contains reserved key {RAW_ROLE_KEY}");
+    }
+
+    extra_object.insert(
+        RAW_ROLE_KEY.to_string(),
+        Value::String(raw_role.to_string()),
+    );
+    Ok(projected_extra)
+}
+
+/// Store exactly one tool-result pairing state in normalized extra fields.
+pub(crate) fn set_tool_result_pairing(
+    extra: &mut Value,
+    tool_call_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let extra_object = object_for_write(extra, "projected extra")?;
+
+    if let Some(tool_call_id) = tool_call_id.map(str::trim).filter(|id| !id.is_empty()) {
+        extra_object.insert(
+            TOOL_CALL_ID_KEY.to_string(),
+            Value::String(tool_call_id.to_string()),
+        );
+        extra_object.remove(UNPAIRED_KEY);
+    } else {
+        extra_object.remove(TOOL_CALL_ID_KEY);
+        extra_object.insert(UNPAIRED_KEY.to_string(), Value::Bool(true));
+    }
+
+    Ok(())
+}
+
+/// Add opaque encrypted content to normalized extra fields after validating
+/// both the original envelope and the projected object for reserved-key use.
+pub(crate) fn add_encrypted_content(
+    raw_envelope: &Value,
+    projected_extra: &mut Value,
+    encrypted_content: &Value,
+) -> anyhow::Result<()> {
+    let raw_object = object_for_read(raw_envelope, "raw envelope")?;
+    if raw_object.contains_key(ENCRYPTED_CONTENT_KEY) {
+        anyhow::bail!("raw envelope already contains reserved key {ENCRYPTED_CONTENT_KEY}");
+    }
+
+    let extra_object = object_for_write(projected_extra, "projected extra")?;
+    if extra_object.contains_key(ENCRYPTED_CONTENT_KEY) {
+        anyhow::bail!("projected extra already contains reserved key {ENCRYPTED_CONTENT_KEY}");
+    }
+
+    let encrypted_content = encrypted_content
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("encrypted_content must be a string"))?;
+    extra_object.insert(
+        ENCRYPTED_CONTENT_KEY.to_string(),
+        Value::String(encrypted_content.to_string()),
+    );
+
+    Ok(())
+}
+
 /// Read an environment variable, trimming whitespace and treating empty strings as unset.
 pub(crate) fn env_var_nonempty(key: &str) -> Option<String> {
     dotenvy::var(key).ok().and_then(|value| {
@@ -280,14 +383,25 @@ pub(crate) fn split_content_blocks(v: &serde_json::Value) -> Vec<TypedBlock> {
             Some("thinking") => {
                 // Real signed Anthropic thinking blocks carry the reasoning in
                 // the `thinking` key (with a `signature`), matching
-                // `pi_agent.rs`; openclaw's normalized shape uses `text`. Read
-                // `thinking` first, fall back to `text`. An empty-string value
-                // still yields a block (real signed blocks can have empty text)
-                // rather than being silently dropped.
+                // `pi_agent.rs`. OpenClaw does the same -- its key is
+                // `thinking` with a `thinkingSignature` beside it. (This
+                // comment used to claim openclaw's normalized shape uses
+                // `text`; that was wrong, and `openclaw.rs` was written to
+                // match the wrong claim, so every OpenClaw thinking block was
+                // dropped. Measured on live sessions: `thinking` in 3713 of
+                // 3713 blocks, `text` in 0.) Read `thinking` first, fall back
+                // to `text`. An empty-string value still yields a block (real
+                // signed blocks can have empty text) rather than being
+                // silently dropped.
+                // Resolve each key to a string before falling through, rather
+                // than picking the key first and stringifying after:
+                // `{"thinking":null,"text":"body"}` would otherwise emit
+                // nothing, because `get("thinking")` yields `Some(Null)` and
+                // `or_else` only fires on `None`. Same for a non-string value.
                 if let Some(text) = item
                     .get("thinking")
-                    .or_else(|| item.get("text"))
                     .and_then(|t| t.as_str())
+                    .or_else(|| item.get("text").and_then(|t| t.as_str()))
                 {
                     blocks.push(TypedBlock::Thinking(text.to_string()));
                 }
@@ -762,5 +876,107 @@ mod tests {
         let blocks = split_content_blocks(&v);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], TypedBlock::Thinking(ref t) if t=="real reasoning"));
+    }
+
+    #[test]
+    fn add_raw_role_inserts_reserved_string_without_touching_other_fields() {
+        let raw_envelope = json!({"source": "chatgpt"});
+        let projected_extra = json!({"existing": true});
+
+        let extra = add_raw_role(&raw_envelope, projected_extra, "assistant").unwrap();
+
+        assert_eq!(extra, json!({"existing": true, "raw_role": "assistant"}));
+        assert_eq!(raw_envelope, json!({"source": "chatgpt"}));
+    }
+
+    #[test]
+    fn add_raw_role_rejects_collision_in_raw_or_projected_extra_and_non_objects() {
+        let raw_collision = add_raw_role(
+            &json!({"raw_role": "original"}),
+            json!({"existing": true}),
+            "assistant",
+        )
+        .unwrap_err();
+        assert!(raw_collision.to_string().contains("raw_role"));
+
+        let projected_collision = add_raw_role(
+            &json!({"source": "chatgpt"}),
+            json!({"raw_role": "projected"}),
+            "assistant",
+        )
+        .unwrap_err();
+        assert!(projected_collision.to_string().contains("raw_role"));
+
+        assert!(add_raw_role(&json!([]), json!({}), "assistant").is_err());
+        assert!(add_raw_role(&json!({}), json!([]), "assistant").is_err());
+        assert!(add_raw_role(&json!({}), json!({}), "   ").is_err());
+    }
+
+    #[test]
+    fn set_tool_result_pairing_enforces_exactly_one_branch() {
+        let mut extra = json!({"tool_call_id": "old", "unpaired": true});
+
+        set_tool_result_pairing(&mut extra, Some(" call_1 ")).unwrap();
+        assert_eq!(
+            extra
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str),
+            Some("call_1")
+        );
+        assert!(extra.get("unpaired").is_none());
+        assert!(
+            extra.get("tool_call_id").is_some() ^ (extra.get("unpaired") == Some(&json!(true)))
+        );
+
+        set_tool_result_pairing(&mut extra, None).unwrap();
+        assert!(extra.get("tool_call_id").is_none());
+        assert_eq!(extra.get("unpaired"), Some(&json!(true)));
+        assert!(
+            extra.get("tool_call_id").is_some() ^ (extra.get("unpaired") == Some(&json!(true)))
+        );
+    }
+
+    #[test]
+    fn add_encrypted_content_rejects_type_duplicate_and_top_level_collision() {
+        let raw_envelope = json!({"source": "chatgpt"});
+        let mut extra = json!({"existing": true});
+        let encrypted = json!("opaque-secret-value");
+
+        add_encrypted_content(&raw_envelope, &mut extra, &encrypted).unwrap();
+        assert_eq!(extra["encrypted_content"], encrypted);
+
+        let duplicate = add_encrypted_content(&raw_envelope, &mut extra, &encrypted).unwrap_err();
+        assert!(duplicate.to_string().contains("encrypted_content"));
+
+        let raw_collision = add_encrypted_content(
+            &json!({"encrypted_content": "original"}),
+            &mut json!({}),
+            &encrypted,
+        )
+        .unwrap_err();
+        assert!(raw_collision.to_string().contains("encrypted_content"));
+
+        let projected_collision = add_encrypted_content(
+            &raw_envelope,
+            &mut json!({"encrypted_content": "projected"}),
+            &encrypted,
+        )
+        .unwrap_err();
+        assert!(
+            projected_collision
+                .to_string()
+                .contains("encrypted_content")
+        );
+
+        let numeric =
+            add_encrypted_content(&raw_envelope, &mut json!({}), &json!(123)).unwrap_err();
+        assert!(numeric.to_string().contains("encrypted_content"));
+        assert!(!numeric.to_string().contains("123"));
+
+        let object =
+            add_encrypted_content(&raw_envelope, &mut json!({}), &json!({"opaque": "secret"}))
+                .unwrap_err();
+        assert!(object.to_string().contains("encrypted_content"));
+        assert!(!object.to_string().contains("secret"));
     }
 }
