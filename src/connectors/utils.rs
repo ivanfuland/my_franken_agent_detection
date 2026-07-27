@@ -383,14 +383,25 @@ pub(crate) fn split_content_blocks(v: &serde_json::Value) -> Vec<TypedBlock> {
             Some("thinking") => {
                 // Real signed Anthropic thinking blocks carry the reasoning in
                 // the `thinking` key (with a `signature`), matching
-                // `pi_agent.rs`; openclaw's normalized shape uses `text`. Read
-                // `thinking` first, fall back to `text`. An empty-string value
-                // still yields a block (real signed blocks can have empty text)
-                // rather than being silently dropped.
+                // `pi_agent.rs`. OpenClaw does the same -- its key is
+                // `thinking` with a `thinkingSignature` beside it. (This
+                // comment used to claim openclaw's normalized shape uses
+                // `text`; that was wrong, and `openclaw.rs` was written to
+                // match the wrong claim, so every OpenClaw thinking block was
+                // dropped. Measured on live sessions: `thinking` in 3713 of
+                // 3713 blocks, `text` in 0.) Read `thinking` first, fall back
+                // to `text`. An empty-string value still yields a block (real
+                // signed blocks can have empty text) rather than being
+                // silently dropped.
+                // Resolve each key to a string before falling through, rather
+                // than picking the key first and stringifying after:
+                // `{"thinking":null,"text":"body"}` would otherwise emit
+                // nothing, because `get("thinking")` yields `Some(Null)` and
+                // `or_else` only fires on `None`. Same for a non-string value.
                 if let Some(text) = item
                     .get("thinking")
-                    .or_else(|| item.get("text"))
                     .and_then(|t| t.as_str())
+                    .or_else(|| item.get("text").and_then(|t| t.as_str()))
                 {
                     blocks.push(TypedBlock::Thinking(text.to_string()));
                 }
