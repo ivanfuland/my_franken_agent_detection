@@ -449,10 +449,16 @@ impl OpenClawConnector {
                     // yields a block rather than being silently dropped -- 2114
                     // of those 3713 are signed-but-empty, and empty is a
                     // definite value, not a missing one.
+                    // The fallback resolves each key to a string before moving
+                    // on, rather than picking the key first and stringifying
+                    // after. `{"thinking":null,"text":"body"}` would otherwise
+                    // emit nothing: `get("thinking")` yields `Some(Null)`, which
+                    // is not `None`, so `or_else` never looks at `text`. Same
+                    // for a non-string `thinking`. Identical form in `utils.rs`.
                     if let Some(text) = block
                         .get("thinking")
-                        .or_else(|| block.get("text"))
                         .and_then(|t| t.as_str())
+                        .or_else(|| block.get("text").and_then(|t| t.as_str()))
                     {
                         blocks.push(OpenClawBlock::Thinking(text.to_string()));
                     }
@@ -1183,6 +1189,44 @@ mod tests {
             .collect();
         assert_eq!(reasoning.len(), 1);
         assert_eq!(reasoning[0].content, "legacy body");
+    }
+
+    /// A present-but-unusable `thinking` must fall through to `text`.
+    ///
+    /// The obvious spelling of the fallback picks the key first and stringifies
+    /// after, which swallows this input: `get("thinking")` returns `Some(Null)`,
+    /// `or_else` only fires on `None`, and the later `as_str()` then yields
+    /// `None` — so nothing is emitted even though a perfectly good `text` sits
+    /// right there. Covers null and a non-string value; the previous test only
+    /// covers an absent primary key, which is a different branch.
+    #[test]
+    fn scan_openclaw_thinking_null_or_non_string_falls_through_to_text() {
+        for probe in [
+            r#"{"type":"thinking","thinking":null,"text":"fallback body"}"#,
+            r#"{"type":"thinking","thinking":123,"text":"fallback body"}"#,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            write_session(
+                &sessions,
+                "session.jsonl",
+                &[&format!(
+                    r#"{{"type":"message","id":"m1","message":{{"role":"assistant","model":"m","content":[{probe}]}}}}"#
+                )],
+            );
+
+            let convs = OpenClawConnector::new()
+                .scan(&ScanContext::local_default(sessions, None))
+                .unwrap();
+            let reasoning: Vec<_> = convs[0]
+                .messages
+                .iter()
+                .filter(|message| message.role == "reasoning")
+                .collect();
+            assert_eq!(reasoning.len(), 1, "probe={probe}");
+            assert_eq!(reasoning[0].content, "fallback body", "probe={probe}");
+        }
     }
 
     #[test]

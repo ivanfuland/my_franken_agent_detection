@@ -393,10 +393,15 @@ pub(crate) fn split_content_blocks(v: &serde_json::Value) -> Vec<TypedBlock> {
                 // to `text`. An empty-string value still yields a block (real
                 // signed blocks can have empty text) rather than being
                 // silently dropped.
+                // Resolve each key to a string before falling through, rather
+                // than picking the key first and stringifying after:
+                // `{"thinking":null,"text":"body"}` would otherwise emit
+                // nothing, because `get("thinking")` yields `Some(Null)` and
+                // `or_else` only fires on `None`. Same for a non-string value.
                 if let Some(text) = item
                     .get("thinking")
-                    .or_else(|| item.get("text"))
                     .and_then(|t| t.as_str())
+                    .or_else(|| item.get("text").and_then(|t| t.as_str()))
                 {
                     blocks.push(TypedBlock::Thinking(text.to_string()));
                 }
