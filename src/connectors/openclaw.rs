@@ -439,7 +439,21 @@ impl OpenClawConnector {
                     blocks.push(OpenClawBlock::ToolResult { text, id });
                 }
                 "thinking" => {
-                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    // Real OpenClaw sessions carry the reasoning in `thinking`
+                    // (alongside a `thinkingSignature`), not in `text`. Reading
+                    // only `text` dropped every thinking block ever written --
+                    // measured across 300 live sessions: 3713 thinking blocks,
+                    // `thinking` present in all 3713 and `text` in 0 of them.
+                    // Same read as `utils.rs`'s typed-block split: `thinking`
+                    // first, fall back to `text`. An empty-string value still
+                    // yields a block rather than being silently dropped -- 2114
+                    // of those 3713 are signed-but-empty, and empty is a
+                    // definite value, not a missing one.
+                    if let Some(text) = block
+                        .get("thinking")
+                        .or_else(|| block.get("text"))
+                        .and_then(|t| t.as_str())
+                    {
                         blocks.push(OpenClawBlock::Thinking(text.to_string()));
                     }
                 }
@@ -1057,7 +1071,7 @@ mod tests {
             "session.jsonl",
             &[
                 r#"{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"ask"}]}}"#,
-                r#"{"type":"message","id":"m2","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"answer"},{"type":"toolCall","id":"call_1","name":"read","arguments":{"path":"fixture.txt"}},{"type":"thinking","text":"inspect first"},{"type":"toolResult","toolCallId":"call_1","content":""}]}}"#,
+                r#"{"type":"message","id":"m2","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"answer"},{"type":"toolCall","id":"call_1","name":"read","arguments":{"path":"fixture.txt"}},{"type":"thinking","thinking":"inspect first","thinkingSignature":"sig-1"},{"type":"toolResult","toolCallId":"call_1","content":""}]}}"#,
                 r#"{"type":"message","id":"m3","message":{"role":"toolResult","toolCallId":"call_1","content":[]}}"#,
             ],
         );
@@ -1088,6 +1102,87 @@ mod tests {
             .find(|message| message.role == "reasoning")
             .expect("thinking block");
         assert_eq!(reasoning.author.as_deref(), Some("synthetic-model"));
+    }
+
+    /// Locks the *real* OpenClaw thinking shape against the implementation.
+    ///
+    /// The shapes here were taken from live sessions, not from reading
+    /// `split_openclaw_blocks`. That distinction is the whole point: the
+    /// implementation, the `utils.rs` comment, two tests and a downstream
+    /// fixture all previously encoded the same wrong belief (`text` carries
+    /// the reasoning), so they agreed with each other and the gate stayed
+    /// green while every thinking block was silently dropped. Measured on
+    /// live sessions: 3713 thinking blocks, `thinking` present in all of
+    /// them, `text` in none.
+    ///
+    /// Both live forms are covered -- signed with a body, and signed with an
+    /// empty body (2114 of the 3713). Empty is a definite value: it must
+    /// still produce a `reasoning` message so the block's position in the
+    /// turn survives, exactly as an empty Claude thinking block does.
+    #[test]
+    fn scan_openclaw_reads_thinking_key_and_keeps_empty_signed_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"ask"}]}}"#,
+                r#"{"type":"message","id":"m2","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"thinking","thinking":"real body","thinkingSignature":"sig-a"},{"type":"thinking","thinking":"","thinkingSignature":"sig-b"}]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let reasoning: Vec<_> = convs[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == "reasoning")
+            .collect();
+
+        assert_eq!(
+            reasoning.len(),
+            2,
+            "both signed thinking blocks must survive, including the empty one"
+        );
+        assert_eq!(reasoning[0].content, "real body");
+        assert_eq!(reasoning[1].content, "");
+        for message in &reasoning {
+            assert_eq!(message.author.as_deref(), Some("synthetic-model"));
+            assert_eq!(message.extra["raw_role"].as_str(), Some("assistant"));
+        }
+    }
+
+    /// The `text` fallback stays supported: `utils.rs` accepts both keys and
+    /// this connector must not diverge from it. Dropping the fallback would
+    /// be a second, opposite version of the same bug.
+    #[test]
+    fn scan_openclaw_still_accepts_legacy_thinking_text_key() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "session.jsonl",
+            &[
+                r#"{"type":"message","id":"m1","message":{"role":"assistant","model":"m","content":[{"type":"thinking","text":"legacy body"}]}}"#,
+            ],
+        );
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+        let reasoning: Vec<_> = convs[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == "reasoning")
+            .collect();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0].content, "legacy body");
     }
 
     #[test]
@@ -1380,7 +1475,7 @@ mod tests {
         let content = concat!(
             r#"{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"Please check that file"}]}}"#,
             "\n",
-            r#"{"type":"message","id":"m2","timestamp":"2026-03-01T00:00:00.000Z","message":{"role":"assistant","model":"claude-opus-4-6","content":[{"type":"text","text":"Let me check that file."},{"type":"toolCall","id":"call_1","name":"bash","arguments":{"cmd":"cat file.txt"}},{"type":"thinking","text":"I should read the file first."}]}}"#,
+            r#"{"type":"message","id":"m2","timestamp":"2026-03-01T00:00:00.000Z","message":{"role":"assistant","model":"claude-opus-4-6","content":[{"type":"text","text":"Let me check that file."},{"type":"toolCall","id":"call_1","name":"bash","arguments":{"cmd":"cat file.txt"}},{"type":"thinking","thinking":"I should read the file first.","thinkingSignature":"sig-1"}]}}"#,
             "\n",
             r#"{"type":"message","id":"m3","timestamp":"2026-03-01T00:00:01.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"toolResult","id":"call_1","toolCallId":"call_1","toolUseId":"call_1","tool_use_id":"call_1","toolName":"bash","name":"bash","content":"file contents here","text":"file contents here"}]}}"#,
             "\n",
