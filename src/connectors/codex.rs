@@ -178,14 +178,20 @@ impl CodexConnector {
             .ok_or_else(|| anyhow::anyhow!("token_count payload must be an object"))?;
         validate_exact_keys(
             payload_object,
-            &["type", "info", "rate_limits"],
-            &[],
+            &["type", "info"],
+            &["rate_limits"],
             "token_count payload",
         )?;
 
+        // `rate_limits` is optional: real-world rollouts from early codex
+        // CLI builds (observed 2025-09, pre-dating this field) omit the key
+        // entirely rather than setting it to `null`. Treat an absent key
+        // the same as an explicit `null` -- both mean "no rate-limit info
+        // attached to this event".
         let rate_limits = payload_object
             .get("rate_limits")
-            .context("validated token_count payload lost rate_limits")?;
+            .cloned()
+            .unwrap_or(Value::Null);
         let info = payload_object
             .get("info")
             .context("validated token_count payload lost info")?;
@@ -3251,6 +3257,30 @@ not valid json at all
             assistant.extra["cass"]["token_usage"]["cache_write_input_tokens"],
             3
         );
+        assert_eq!(assistant.extra["cass"]["token_usage"]["total_tokens"], 21);
+        assert_eq!(assistant.extra["cass"]["token_usage"]["data_source"], "api");
+    }
+
+    #[test]
+    fn scan_codex_legacy_token_count_without_rate_limits_key_attaches_usage() {
+        // Shape anchored to a real-world corpus sample, not invented from
+        // reading this implementation (fad-fork EXEC discipline): a python
+        // scan of 83 real codex rollout files found 7 files / 101
+        // token_count events (all dated 2025-09-17, an early codex CLI
+        // build) whose `payload` is exactly `{type, info}` -- `rate_limits`
+        // is not present as a key at all, not even `null`. Values below are
+        // fully synthetic; only the key-set shape is real.
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"cached_input_tokens":1,"cache_write_input_tokens":3,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21},"model_context_window":128000,"total_token_usage":{"input_tokens":700,"cached_input_tokens":100,"output_tokens":1100,"reasoning_output_tokens":200,"total_tokens":2100}}}}"#,
+            "\n",
+        );
+
+        let convs = scan_synthetic_jsonl(content).unwrap();
+        let assistant = &convs[0].messages[0];
+        assert_eq!(assistant.extra["cass"]["token_usage"]["input_tokens"], 7);
+        assert_eq!(assistant.extra["cass"]["token_usage"]["output_tokens"], 11);
         assert_eq!(assistant.extra["cass"]["token_usage"]["total_tokens"], 21);
         assert_eq!(assistant.extra["cass"]["token_usage"]["data_source"], "api");
     }
