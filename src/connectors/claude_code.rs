@@ -6,12 +6,17 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{
+    TypedBlock, add_raw_role, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    set_tool_result_pairing, split_content_blocks,
+};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct ClaudeCodeConnector;
 
@@ -394,6 +399,31 @@ impl ClaudeCodeConnector {
             Value::Object(out)
         }
     }
+
+    /// Render a `tool_use` block's own content: `<name>(<args JSON>)`, or
+    /// just `<name>` when there's no input. This is prose for a human/
+    /// embedding to skim — the full untruncated args always live in
+    /// `extra["tool_call_args"]` for exact reconstruction (canonical args
+    /// are never truncated; a content cap would be an adapter-feed concern,
+    /// which we don't add here — see spec §3.2).
+    fn render_tool_call_content(name: &str, input: Option<&Value>) -> String {
+        match input {
+            Some(value) if !value.is_null() => format!("{name}({value})"),
+            _ => name.to_string(),
+        }
+    }
+
+    /// Render a `tool_result` block's content. The block's `content` may be
+    /// a plain string or an array of text blocks (the same shapes
+    /// `split_content_blocks` already parses) — never truncated.
+    fn render_tool_result_content(content: Option<&Value>) -> String {
+        match content {
+            Some(Value::String(s)) => s.clone(),
+            Some(value @ Value::Array(_)) => flatten_content(value),
+            Some(value) => value.to_string(),
+            None => String::new(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -508,17 +538,34 @@ fn scan_claude_with_callback_with_exclusions(
                     }
 
                     let entry_type = val.get("type").and_then(|v| v.as_str());
-                    let role_hint = val
-                        .get("message")
-                        .and_then(|m| m.get("role"))
-                        .and_then(|v| v.as_str())
-                        .or_else(|| val.get("role").and_then(|v| v.as_str()));
-                    let is_user_assistant = matches!(entry_type, Some("user" | "assistant"))
-                        || (entry_type == Some("message")
-                            && matches!(role_hint, Some("user" | "assistant")));
-                    if !is_user_assistant {
+                    let inner_role = val.get("message").and_then(|message| message.get("role"));
+                    let message_role = match (entry_type, inner_role) {
+                        (Some("user" | "assistant" | "message"), Some(Value::String(role)))
+                            if matches!(role.as_str(), "user" | "assistant") =>
+                        {
+                            Some(role.as_str())
+                        }
+                        (Some(role @ ("user" | "assistant")), None) => Some(role),
+                        _ => None,
+                    };
+                    // Claude `system` records carry several subtypes (spec §3.3,
+                    // P1-2): `away_summary` has real content and becomes an
+                    // `assistant` message while retaining `raw_role=system`;
+                    // `turn_duration`/`stop_hook_summary` are pure metrics, and
+                    // everything else (`permission-mode`/`mode`/`last-prompt`,
+                    // covered by top-level `type` values other than `system` and
+                    // already excluded above) is config noise — both classes are
+                    // dropped explicitly rather than silently mis-typed.
+                    let is_system_away_summary = entry_type == Some("system")
+                        && val.get("subtype").and_then(|v| v.as_str()) == Some("away_summary");
+                    let raw_role = if is_system_away_summary {
+                        Some("system")
+                    } else {
+                        message_role
+                    };
+                    let Some(raw_role) = raw_role else {
                         continue;
-                    }
+                    };
 
                     let created = val.get("timestamp").and_then(parse_timestamp);
 
@@ -534,39 +581,188 @@ fn scan_claude_with_callback_with_exclusions(
                         (None, None) => None,
                     };
 
-                    let role = role_hint.or(entry_type).unwrap_or("agent");
+                    let projected_extra = if compact_message_extra {
+                        ClaudeCodeConnector::compact_message_extra(&val)
+                    } else {
+                        val.clone()
+                    };
+                    let base_extra = add_raw_role(&val, projected_extra, raw_role)?;
+
+                    if is_system_away_summary {
+                        let content_str =
+                            ClaudeCodeConnector::non_empty_json_string(&val, "content")
+                                .unwrap_or_default();
+                        if !content_str.trim().is_empty() {
+                            messages.push(NormalizedMessage {
+                                idx: 0,
+                                role: "assistant".to_string(),
+                                author: None,
+                                created_at: created,
+                                content: content_str,
+                                extra: base_extra,
+                                invocations: Vec::new(),
+                                snippets: Vec::new(),
+                            });
+                        }
+                        continue;
+                    }
+
+                    let role = raw_role;
                     let content_val = val
                         .get("message")
                         .and_then(|m| m.get("content"))
                         .or_else(|| val.get("content"));
-                    let content_str = content_val.map(flatten_content).unwrap_or_default();
+                    let author = if role == "assistant" {
+                        val.get("message")
+                            .and_then(|m| m.get("model"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    } else {
+                        None
+                    };
 
-                    if content_str.trim().is_empty() {
-                        continue;
+                    match content_val {
+                        Some(Value::Array(_)) => {
+                            // Real Claude Code content arrays interleave prose
+                            // text, tool_use, tool_result, and thinking blocks.
+                            // Split by type (Task 1.1's split_content_blocks)
+                            // instead of flattening everything into one string,
+                            // so each structural block becomes its own typed
+                            // 6-role message (spec §3.3) rather than an inline
+                            // `[Tool:...]` marker glued into assistant prose.
+                            let blocks = split_content_blocks(content_val.unwrap());
+
+                            let mut prose = String::new();
+                            for block in &blocks {
+                                if let TypedBlock::Text(text) = block {
+                                    if !prose.is_empty() {
+                                        prose.push('\n');
+                                    }
+                                    prose.push_str(text);
+                                }
+                            }
+                            if !prose.trim().is_empty() {
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: role.to_string(),
+                                    author: author.clone(),
+                                    created_at: created,
+                                    content: prose,
+                                    extra: base_extra.clone(),
+                                    invocations: Vec::new(),
+                                    snippets: Vec::new(),
+                                });
+                            }
+
+                            for block in blocks {
+                                match block {
+                                    TypedBlock::Text(_) => {}
+                                    TypedBlock::ToolCall { name, input, id } => {
+                                        if role != "assistant" {
+                                            continue;
+                                        }
+                                        let content = ClaudeCodeConnector::render_tool_call_content(
+                                            &name,
+                                            input.as_ref(),
+                                        );
+                                        let mut extra = base_extra.clone();
+                                        if let Value::Object(map) = &mut extra {
+                                            if let Some(ref call_id) = id {
+                                                map.insert(
+                                                    "tool_call_id".to_string(),
+                                                    Value::String(call_id.clone()),
+                                                );
+                                            }
+                                            map.insert(
+                                                "tool_call_args".to_string(),
+                                                input.clone().unwrap_or(Value::Null),
+                                            );
+                                        }
+                                        // tool_call/tool_result pairing is via
+                                        // this explicit id (extra["tool_call_id"]),
+                                        // never content order (spec P-原则-3).
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "tool_call".to_string(),
+                                            author: author.clone(),
+                                            created_at: created,
+                                            content,
+                                            extra,
+                                            invocations: vec![NormalizedInvocation {
+                                                kind: "tool".to_string(),
+                                                name,
+                                                raw_name: None,
+                                                call_id: id,
+                                                arguments: input,
+                                            }],
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                    TypedBlock::ToolResult {
+                                        content,
+                                        tool_use_id,
+                                    } => {
+                                        if role != "user" {
+                                            continue;
+                                        }
+                                        let content_str =
+                                            ClaudeCodeConnector::render_tool_result_content(
+                                                content.as_ref(),
+                                            );
+                                        let mut extra = base_extra.clone();
+                                        set_tool_result_pairing(
+                                            &mut extra,
+                                            tool_use_id.as_deref(),
+                                        )?;
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "tool_result".to_string(),
+                                            author: None,
+                                            created_at: created,
+                                            content: content_str,
+                                            extra,
+                                            invocations: Vec::new(),
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                    TypedBlock::Thinking(text) => {
+                                        if role != "assistant" {
+                                            continue;
+                                        }
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "reasoning".to_string(),
+                                            author: author.clone(),
+                                            created_at: created,
+                                            content: text,
+                                            extra: base_extra.clone(),
+                                            invocations: Vec::new(),
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Some(other) => {
+                            // Not a content-block array (e.g. a plain string) —
+                            // no tool_use/tool_result/thinking blocks are
+                            // possible here, so no invocations to extract.
+                            let content_str = flatten_content(other);
+                            if !content_str.trim().is_empty() {
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: role.to_string(),
+                                    author,
+                                    created_at: created,
+                                    content: content_str,
+                                    extra: base_extra,
+                                    invocations: Vec::new(),
+                                    snippets: Vec::new(),
+                                });
+                            }
+                        }
+                        None => {}
                     }
-
-                    let author = val
-                        .get("message")
-                        .and_then(|m| m.get("model"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let invocations =
-                        content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
-
-                    messages.push(NormalizedMessage {
-                        idx: 0,
-                        role: role.to_string(),
-                        author,
-                        created_at: created,
-                        content: content_str,
-                        extra: if compact_message_extra {
-                            ClaudeCodeConnector::compact_message_extra(&val)
-                        } else {
-                            val
-                        },
-                        invocations,
-                        snippets: Vec::new(),
-                    });
                 }
                 crate::types::reindex_messages(&mut messages);
             } else {
@@ -785,6 +981,34 @@ mod tests {
         let claude_dir = base.join(".claude");
         fs::create_dir_all(claude_dir.join("projects")).unwrap();
         claude_dir
+    }
+
+    fn scan_explicit_file(path: &Path) -> Result<Vec<NormalizedConversation>> {
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::with_roots(
+            path.parent().unwrap().to_path_buf(),
+            vec![ScanRoot::local(path.to_path_buf())],
+            None,
+        );
+        connector.scan(&ctx)
+    }
+
+    fn normalized_fields(conversation: &NormalizedConversation) -> Vec<Value> {
+        conversation
+            .messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "role": message.role,
+                    "content": message.content,
+                    "author": message.author,
+                    "raw_role": message.extra.get("raw_role"),
+                    "tool_call_id": message.extra.get("tool_call_id"),
+                    "tool_call_args": message.extra.get("tool_call_args"),
+                    "unpaired": message.extra.get("unpaired"),
+                })
+            })
+            .collect()
     }
 
     // =========================================================================
@@ -1210,21 +1434,52 @@ mod tests {
     }
 
     #[test]
-    fn scan_extracts_model_as_author() {
+    fn scan_extracts_model_as_author_only_for_assistant_envelopes() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
 
         let session_file = claude_dir.join("session.jsonl");
-        let content = r#"{"type":"assistant","message":{"role":"assistant","content":"Response","model":"claude-3-opus"}}"#;
+        let content = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":"Response","model":"claude-3-opus"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","model":"spoofed-user-model","content":[{"type":"text","text":"Question"},{"type":"tool_result","tool_use_id":"toolu_user_result","content":"Result"}]}}"#,
+            "\n",
+        );
         fs::write(&session_file, content).unwrap();
 
         let connector = ClaudeCodeConnector::new();
         let ctx = ScanContext::local_default(claude_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
+        let assistant = convs[0]
+            .messages
+            .iter()
+            .find(|message| message.content == "Response")
+            .expect("assistant message");
         assert_eq!(
-            convs[0].messages[0].author,
-            Some("claude-3-opus".to_string())
+            assistant.author.as_deref(),
+            Some("claude-3-opus"),
+            "assistant envelopes retain their real model as author"
+        );
+
+        let user = convs[0]
+            .messages
+            .iter()
+            .find(|message| message.content == "Question")
+            .expect("user prose message");
+        assert!(
+            user.author.is_none(),
+            "user envelopes never expose message.model as author"
+        );
+
+        let tool_result = convs[0]
+            .messages
+            .iter()
+            .find(|message| message.role == "tool_result")
+            .expect("user-carried tool result");
+        assert!(
+            tool_result.author.is_none(),
+            "tool_result author remains empty even when its user envelope has a model"
         );
     }
 
@@ -1318,6 +1573,139 @@ mod tests {
     }
 
     #[test]
+    fn scan_claude_inner_role_is_authoritative_and_strictly_whitelisted() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"retained neighbor"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"developer","content":"drop inner developer"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"not-a-role","content":"drop inner unknown"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":7,"content":"drop inner nonstring"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"assistant","content":"inner assistant wins"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"outer user fallback"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":"outer assistant fallback"}}"#,
+            "\n",
+            r#"{"type":"message","role":"user","message":{"content":"drop top-level role fallback"}}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let convs = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1, "retained neighbor prevents a vacuous scan");
+        let emitted = convs[0]
+            .messages
+            .iter()
+            .map(|message| {
+                (
+                    message.content.as_str(),
+                    message.role.as_str(),
+                    message.extra["raw_role"].as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted,
+            vec![
+                ("retained neighbor", "user", Some("user")),
+                ("inner assistant wins", "assistant", Some("assistant")),
+                ("outer user fallback", "user", Some("user")),
+                ("outer assistant fallback", "assistant", Some("assistant")),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_claude_user_envelope_drops_tool_use_but_retains_prose() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"retained user prose"},{"type":"tool_use","id":"wrong-owner-call","name":"WRONG_OWNER_TOOL_CALL_SENTINEL","input":{"value":"WRONG_OWNER_ARGS_SENTINEL"}}]}}"#,
+        )
+        .unwrap();
+
+        let convs = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1, "legal prose prevents a vacuous scan");
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].role, "user");
+        assert_eq!(convs[0].messages[0].content, "retained user prose");
+        assert!(
+            convs[0]
+                .messages
+                .iter()
+                .all(|message| message.role != "tool_call"
+                    && !message.content.contains("WRONG_OWNER_TOOL_CALL_SENTINEL")
+                    && !message.content.contains("WRONG_OWNER_ARGS_SENTINEL"))
+        );
+    }
+
+    #[test]
+    fn scan_claude_assistant_envelope_drops_tool_result_but_retains_prose() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"retained assistant prose"},{"type":"tool_result","tool_use_id":"wrong-owner-result","content":"WRONG_OWNER_TOOL_RESULT_SENTINEL"}]}}"#,
+        )
+        .unwrap();
+
+        let convs = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1, "legal prose prevents a vacuous scan");
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].role, "assistant");
+        assert_eq!(convs[0].messages[0].content, "retained assistant prose");
+        assert!(
+            convs[0]
+                .messages
+                .iter()
+                .all(|message| message.role != "tool_result"
+                    && !message.content.contains("WRONG_OWNER_TOOL_RESULT_SENTINEL"))
+        );
+    }
+
+    #[test]
+    fn scan_claude_user_envelope_drops_thinking_but_retains_prose() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"retained user prose"},{"type":"thinking","thinking":"WRONG_OWNER_THINKING_SENTINEL","signature":"synthetic-signature"}]}}"#,
+        )
+        .unwrap();
+
+        let convs = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1, "legal prose prevents a vacuous scan");
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].role, "user");
+        assert_eq!(convs[0].messages[0].content, "retained user prose");
+        assert!(
+            convs[0]
+                .messages
+                .iter()
+                .all(|message| message.role != "reasoning"
+                    && !message.content.contains("WRONG_OWNER_THINKING_SENTINEL"))
+        );
+    }
+
+    #[test]
     fn scan_reindexes_messages_sequentially() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
@@ -1336,6 +1724,384 @@ mod tests {
         assert_eq!(convs[0].messages[0].idx, 0);
         assert_eq!(convs[0].messages[1].idx, 1);
         assert_eq!(convs[0].messages[2].idx, 2);
+    }
+
+    // =========================================================================
+    // 6-role normalization tests (franken fork, spec §3.3 claude)
+    // =========================================================================
+
+    #[test]
+    fn scan_claude_splits_content_blocks_into_typed_6role_messages() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let session_file = claude_dir.join("session.jsonl");
+        // Real Claude Code raw shapes (verified against ~/.claude/projects):
+        // assistant record with text + tool_use + thinking blocks, followed
+        // by a user record carrying the paired tool_result block.
+        let content = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","model":"claude-opus-4-6","content":[{"type":"text","text":"Let me check that file."},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"/tmp/foo.txt"}},{"type":"thinking","thinking":"I should read the file first.","signature":"sig123"}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"file contents here"}]}}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+
+        let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
+        assert!(roles.contains(&"tool_call"), "roles: {roles:?}");
+        assert!(roles.contains(&"tool_result"), "roles: {roles:?}");
+        assert!(roles.contains(&"reasoning"), "roles: {roles:?}");
+        assert!(!roles.contains(&"agent"), "roles: {roles:?}");
+
+        let assistant = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant prose message");
+        assert!(!assistant.content.contains("[Tool:"));
+        assert!(assistant.content.contains("Let me check that file."));
+        assert_eq!(assistant.author.as_deref(), Some("claude-opus-4-6"));
+
+        let tool_call = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call")
+            .expect("tool_call message");
+        assert!(tool_call.content.contains("Read"));
+        assert_eq!(
+            tool_call.extra["tool_call_id"].as_str(),
+            Some("toolu_01"),
+            "tool_call's own id must be stored for the tool_result to pair against"
+        );
+        assert_eq!(
+            tool_call.extra["tool_call_args"]["file_path"], "/tmp/foo.txt",
+            "full args must be preserved in extra, never truncated"
+        );
+
+        let tool_result = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("tool_result message");
+        assert!(tool_result.extra.get("tool_call_id").is_some());
+        assert_eq!(tool_result.extra["tool_call_id"].as_str(), Some("toolu_01"));
+        assert_eq!(tool_result.content, "file contents here");
+
+        let reasoning = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("reasoning message");
+        assert_eq!(reasoning.content, "I should read the file first.");
+
+        // idx must be contiguous 0..N after splitting one raw record into
+        // several messages (spec §3.4).
+        assert!(
+            conv.messages
+                .iter()
+                .enumerate()
+                .all(|(i, m)| m.idx as usize == i)
+        );
+    }
+
+    #[test]
+    fn scan_claude_thinking_block_emits_reasoning_even_when_empty() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let session_file = claude_dir.join("session.jsonl");
+        let content = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"thinking","thinking":"","signature":"sig"}]}}"#;
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        let reasoning = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("empty-text thinking block must still emit a reasoning message");
+        assert_eq!(reasoning.content, "");
+    }
+
+    #[test]
+    fn scan_claude_away_summary_becomes_assistant_with_system_raw_role() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let session_file = claude_dir.join("session.jsonl");
+        let content = concat!(
+            r#"{"type":"system","subtype":"away_summary","timestamp":"2026-01-01T00:00:00Z","content":"Synthetic away summary."}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let away_summary = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.content == "Synthetic away summary.")
+            .expect("away_summary should produce a retained message");
+        assert_eq!(away_summary.role, "assistant");
+        assert_eq!(away_summary.extra["raw_role"], "system");
+        assert!(away_summary.author.is_none());
+        assert_eq!(away_summary.created_at, Some(1_767_225_600_000));
+    }
+
+    #[test]
+    fn scan_claude_system_metric_and_config_subtypes_are_dropped() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let session_file = claude_dir.join("session.jsonl");
+        // stop_hook_summary / turn_duration are pure-metric `system` subtypes;
+        // permission-mode / last-prompt are separate top-level `type` values
+        // that carry config noise. Both classes must be dropped explicitly
+        // (spec §3.3 P1-2), not silently mis-typed into another role.
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"stop_hook_summary","hookCount":2}"#,
+            "\n",
+            r#"{"type":"system","subtype":"turn_duration","durationMs":151876}"#,
+            "\n",
+            r#"{"type":"permission-mode","permissionMode":"bypassPermissions"}"#,
+            "\n",
+            r#"{"type":"last-prompt","lastPrompt":"pull"}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].role, "user");
+    }
+
+    #[test]
+    fn scan_claude_sets_envelope_raw_role_on_every_split_block() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        let content = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"assistant prose"},{"type":"tool_use","id":"synthetic-call","name":"Read","input":{"path":"/tmp/synthetic.txt"}},{"type":"thinking","thinking":"synthetic reasoning"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"user prose"},{"type":"tool_result","tool_use_id":"synthetic-call","content":"synthetic result"}]}}"#,
+            "\n",
+        );
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+        let messages = &convs[0].messages;
+
+        assert_eq!(messages.len(), 5);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.extra.get("raw_role").is_some()),
+            "every retained split block must carry raw_role"
+        );
+        assert!(messages.iter().all(|message| {
+            let expected = match message.role.as_str() {
+                "assistant" | "tool_call" | "reasoning" => "assistant",
+                "user" | "tool_result" => "user",
+                role => panic!("unexpected normalized role: {role}"),
+            };
+            message.extra["raw_role"] == expected
+        }));
+        assert!(
+            messages
+                .iter()
+                .enumerate()
+                .all(|(idx, message)| usize::try_from(message.idx) == Ok(idx))
+        );
+    }
+
+    #[test]
+    fn scan_claude_tool_result_without_id_is_explicitly_unpaired() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":""}]}}"#,
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+        let result = &convs[0].messages[0];
+
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(result.role, "tool_result");
+        assert_eq!(result.content, "");
+        assert_eq!(result.extra["raw_role"], "user");
+        assert_eq!(result.extra["unpaired"], true);
+        assert!(result.extra.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn scan_claude_compact_and_noncompact_normalized_fields_match() {
+        let dir = TempDir::new().unwrap();
+        let small_path = dir.path().join("small.jsonl");
+        let compact_path = dir.path().join("compact.jsonl");
+        let assistant = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "synthetic-model",
+                "content": [
+                    {"type": "text", "text": "synthetic prose"},
+                    {
+                        "type": "tool_use",
+                        "id": "synthetic-call",
+                        "name": "Read",
+                        "input": {"path": "/tmp/synthetic.txt", "limit": 123}
+                    },
+                    {"type": "thinking", "thinking": "synthetic complete reasoning"}
+                ]
+            }
+        });
+        let user = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "synthetic-call", "content": ""},
+                    {"type": "tool_result", "content": "synthetic unpaired result"}
+                ]
+            }
+        });
+        fs::write(&small_path, format!("{}\n{}\n", assistant, user)).unwrap();
+
+        let mut padded_assistant = assistant;
+        let padding_len = usize::try_from(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES + 1024)
+            .expect("compact threshold must fit in usize");
+        padded_assistant["padding"] = Value::String("p".repeat(padding_len));
+        fs::write(&compact_path, format!("{}\n{}\n", padded_assistant, user)).unwrap();
+        let compact_len = fs::metadata(&compact_path).unwrap().len();
+        assert!(compact_len >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES);
+        assert!(compact_len < 100 * 1024 * 1024);
+
+        let small = scan_explicit_file(&small_path).unwrap();
+        let compact = scan_explicit_file(&compact_path).unwrap();
+        assert_eq!(normalized_fields(&small[0]), normalized_fields(&compact[0]));
+
+        for message in &compact[0].messages {
+            assert!(message.extra.get("padding").is_none());
+            assert!(message.extra.get("message").is_none());
+            assert!(message.extra.get("type").is_none());
+            assert!(message.extra.get("raw_role").is_some());
+        }
+        let paired_empty = compact[0]
+            .messages
+            .iter()
+            .find(|message| message.role == "tool_result" && message.content.is_empty())
+            .expect("empty paired tool result must survive compact parsing");
+        assert_eq!(paired_empty.extra["tool_call_id"], "synthetic-call");
+        assert!(paired_empty.extra.get("unpaired").is_none());
+        let unpaired = compact[0]
+            .messages
+            .iter()
+            .find(|message| message.extra.get("unpaired") == Some(&json!(true)))
+            .expect("missing-id tool result must be retained and marked unpaired");
+        assert_eq!(unpaired.content, "synthetic unpaired result");
+    }
+
+    #[test]
+    fn scan_claude_compact_path_rejects_raw_envelope_raw_role_collision() {
+        let dir = TempDir::new().unwrap();
+        let session_path = dir.path().join("collision.jsonl");
+        let padding_len = usize::try_from(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES + 1024)
+            .expect("compact threshold must fit in usize");
+        let envelope = json!({
+            "type": "user",
+            "raw_role": "collision",
+            "padding": "p".repeat(padding_len),
+            "message": {"role": "user", "content": "synthetic collision"}
+        });
+        fs::write(&session_path, format!("{envelope}\n")).unwrap();
+        assert!(
+            fs::metadata(&session_path).unwrap().len()
+                >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES
+        );
+
+        let error = scan_explicit_file(&session_path).unwrap_err();
+        assert!(error.to_string().contains("raw_role"));
+    }
+
+    #[test]
+    fn scan_claude_legacy_whole_file_formats_keep_literal_normalized_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let raw = json!({
+            "title": "Synthetic legacy session",
+            "messages": [
+                {"role": "user", "content": "legacy user"},
+                {"role": "assistant", "content": "legacy assistant"}
+            ]
+        });
+
+        for extension in ["json", "claude"] {
+            let session_path = dir.path().join(format!("session.{extension}"));
+            fs::write(&session_path, raw.to_string()).unwrap();
+            let convs = scan_explicit_file(&session_path).unwrap();
+            let snapshot: Vec<Value> = convs[0]
+                .messages
+                .iter()
+                .map(|message| {
+                    json!({
+                        "idx": message.idx,
+                        "role": message.role,
+                        "author": message.author,
+                        "created_at": message.created_at,
+                        "content": message.content,
+                        "extra": message.extra,
+                    })
+                })
+                .collect();
+
+            assert_eq!(
+                snapshot,
+                vec![
+                    json!({
+                        "idx": 0,
+                        "role": "user",
+                        "author": null,
+                        "created_at": null,
+                        "content": "legacy user",
+                        "extra": {"role": "user", "content": "legacy user"},
+                    }),
+                    json!({
+                        "idx": 1,
+                        "role": "assistant",
+                        "author": null,
+                        "created_at": null,
+                        "content": "legacy assistant",
+                        "extra": {"role": "assistant", "content": "legacy assistant"},
+                    }),
+                ],
+                "{extension} whole-file normalized output changed"
+            );
+        }
     }
 
     // =========================================================================

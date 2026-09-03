@@ -2,6 +2,109 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
+const RAW_ROLE_KEY: &str = "raw_role";
+const TOOL_CALL_ID_KEY: &str = "tool_call_id";
+const UNPAIRED_KEY: &str = "unpaired";
+const ENCRYPTED_CONTENT_KEY: &str = "encrypted_content";
+
+fn object_for_read<'a>(
+    value: &'a Value,
+    field_name: &str,
+) -> anyhow::Result<&'a serde_json::Map<String, Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("{field_name} must be an object"))
+}
+
+fn object_for_write<'a>(
+    value: &'a mut Value,
+    field_name: &str,
+) -> anyhow::Result<&'a mut serde_json::Map<String, Value>> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{field_name} must be an object"))
+}
+
+/// Add the source role to a normalized message's extra fields without losing
+/// collision evidence from the original envelope.
+pub(crate) fn add_raw_role(
+    raw_envelope: &Value,
+    projected_extra: Value,
+    raw_role: &str,
+) -> anyhow::Result<Value> {
+    if raw_role.trim().is_empty() {
+        anyhow::bail!("raw_role must be non-empty");
+    }
+
+    let raw_object = object_for_read(raw_envelope, "raw envelope")?;
+    if raw_object.contains_key(RAW_ROLE_KEY) {
+        anyhow::bail!("raw envelope already contains reserved key {RAW_ROLE_KEY}");
+    }
+
+    let mut projected_extra = projected_extra;
+    let extra_object = object_for_write(&mut projected_extra, "projected extra")?;
+    if extra_object.contains_key(RAW_ROLE_KEY) {
+        anyhow::bail!("projected extra already contains reserved key {RAW_ROLE_KEY}");
+    }
+
+    extra_object.insert(
+        RAW_ROLE_KEY.to_string(),
+        Value::String(raw_role.to_string()),
+    );
+    Ok(projected_extra)
+}
+
+/// Store exactly one tool-result pairing state in normalized extra fields.
+pub(crate) fn set_tool_result_pairing(
+    extra: &mut Value,
+    tool_call_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let extra_object = object_for_write(extra, "projected extra")?;
+
+    if let Some(tool_call_id) = tool_call_id.map(str::trim).filter(|id| !id.is_empty()) {
+        extra_object.insert(
+            TOOL_CALL_ID_KEY.to_string(),
+            Value::String(tool_call_id.to_string()),
+        );
+        extra_object.remove(UNPAIRED_KEY);
+    } else {
+        extra_object.remove(TOOL_CALL_ID_KEY);
+        extra_object.insert(UNPAIRED_KEY.to_string(), Value::Bool(true));
+    }
+
+    Ok(())
+}
+
+/// Add opaque encrypted content to normalized extra fields after validating
+/// both the original envelope and the projected object for reserved-key use.
+pub(crate) fn add_encrypted_content(
+    raw_envelope: &Value,
+    projected_extra: &mut Value,
+    encrypted_content: &Value,
+) -> anyhow::Result<()> {
+    let raw_object = object_for_read(raw_envelope, "raw envelope")?;
+    if raw_object.contains_key(ENCRYPTED_CONTENT_KEY) {
+        anyhow::bail!("raw envelope already contains reserved key {ENCRYPTED_CONTENT_KEY}");
+    }
+
+    let extra_object = object_for_write(projected_extra, "projected extra")?;
+    if extra_object.contains_key(ENCRYPTED_CONTENT_KEY) {
+        anyhow::bail!("projected extra already contains reserved key {ENCRYPTED_CONTENT_KEY}");
+    }
+
+    let encrypted_content = encrypted_content
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("encrypted_content must be a string"))?;
+    extra_object.insert(
+        ENCRYPTED_CONTENT_KEY.to_string(),
+        Value::String(encrypted_content.to_string()),
+    );
+
+    Ok(())
+}
+
 /// Read an environment variable, trimming whitespace and treating empty strings as unset.
 pub(crate) fn env_var_nonempty(key: &str) -> Option<String> {
     dotenvy::var(key).ok().and_then(|value| {
@@ -201,6 +304,112 @@ pub fn flatten_content(val: &serde_json::Value) -> String {
     }
 
     String::new()
+}
+
+/// A single content-array element, split by block type rather than merged
+/// into one flattened string.
+///
+/// Unlike [`flatten_content`] (which collapses everything into a single
+/// display string and drops `tool_result`/`thinking` blocks entirely), this
+/// preserves each block's full structure and type so callers can emit typed
+/// 6-role messages. `ToolCall.input` and `ToolResult.content` always carry
+/// the complete, untruncated value — truncation is an adapter-feed concern,
+/// never a canonical/franken one.
+pub(crate) enum TypedBlock {
+    /// `{"type":"text","text":...}` (also covers `input_text`/`output_text`).
+    Text(String),
+    /// `{"type":"tool_use",...}` — full args preserved in `input`.
+    ToolCall {
+        name: String,
+        input: Option<serde_json::Value>,
+        id: Option<String>,
+    },
+    /// `{"type":"tool_result",...}` — full content preserved.
+    ToolResult {
+        content: Option<serde_json::Value>,
+        tool_use_id: Option<String>,
+    },
+    /// `{"type":"thinking","text":...}`.
+    Thinking(String),
+}
+
+/// Split a content array (or plain string) into typed blocks by block type,
+/// instead of flattening everything into one string.
+///
+/// This is the typed counterpart to [`flatten_content`]: it keeps
+/// `tool_result` and `thinking` blocks (which `flatten_content`'s whitelist
+/// drops) and preserves full `tool_use`/`tool_result` payloads unmodified.
+/// Malformed blocks (missing required fields) are skipped rather than
+/// causing a panic.
+#[must_use]
+pub(crate) fn split_content_blocks(v: &serde_json::Value) -> Vec<TypedBlock> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+
+    let mut blocks = Vec::new();
+    for item in arr {
+        let item_type = item.get("type").and_then(|t| t.as_str());
+        match item_type {
+            Some("text") | Some("input_text") | Some("output_text") => {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    blocks.push(TypedBlock::Text(text.to_string()));
+                }
+            }
+            Some("tool_use") => {
+                let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let id = item
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .map(std::string::ToString::to_string);
+                blocks.push(TypedBlock::ToolCall {
+                    name: name.to_string(),
+                    input: item.get("input").cloned(),
+                    id,
+                });
+            }
+            Some("tool_result") => {
+                let tool_use_id = item
+                    .get("tool_use_id")
+                    .and_then(|i| i.as_str())
+                    .map(std::string::ToString::to_string);
+                blocks.push(TypedBlock::ToolResult {
+                    content: item.get("content").cloned(),
+                    tool_use_id,
+                });
+            }
+            Some("thinking") => {
+                // Real signed Anthropic thinking blocks carry the reasoning in
+                // the `thinking` key (with a `signature`), matching
+                // `pi_agent.rs`. OpenClaw does the same -- its key is
+                // `thinking` with a `thinkingSignature` beside it. (This
+                // comment used to claim openclaw's normalized shape uses
+                // `text`; that was wrong, and `openclaw.rs` was written to
+                // match the wrong claim, so every OpenClaw thinking block was
+                // dropped. Measured on live sessions: `thinking` in 3713 of
+                // 3713 blocks, `text` in 0.) Read `thinking` first, fall back
+                // to `text`. An empty-string value still yields a block (real
+                // signed blocks can have empty text) rather than being
+                // silently dropped.
+                // Resolve each key to a string before falling through, rather
+                // than picking the key first and stringifying after:
+                // `{"thinking":null,"text":"body"}` would otherwise emit
+                // nothing, because `get("thinking")` yields `Some(Null)` and
+                // `or_else` only fires on `None`. Same for a non-string value.
+                if let Some(text) = item
+                    .get("thinking")
+                    .and_then(|t| t.as_str())
+                    .or_else(|| item.get("text").and_then(|t| t.as_str()))
+                {
+                    blocks.push(TypedBlock::Thinking(text.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
 }
 
 /// Extract text content from a single content block item.
@@ -637,5 +846,137 @@ mod tests {
         assert_eq!(invocations[0].kind, "tool");
         assert_eq!(invocations[0].name, "skill");
         assert!(invocations[0].raw_name.is_none());
+    }
+
+    // --- split_content_blocks tests ---
+
+    #[test]
+    fn split_content_blocks_separates_text_tooluse_toolresult_thinking() {
+        let v = json!([
+            {"type":"text","text":"hi"},
+            {"type":"tool_use","name":"Read","id":"tu_1","input":{"file_path":"/a"}},
+            {"type":"tool_result","tool_use_id":"tu_1","content":"file body"},
+            {"type":"thinking","text":"let me think"}
+        ]);
+        let blocks = split_content_blocks(&v);
+        assert_eq!(blocks.len(), 4);
+        assert!(matches!(blocks[0], TypedBlock::Text(ref t) if t=="hi"));
+        assert!(
+            matches!(&blocks[1], TypedBlock::ToolCall{name, id, ..} if name=="Read" && id.as_deref()==Some("tu_1"))
+        );
+        assert!(
+            matches!(&blocks[2], TypedBlock::ToolResult{tool_use_id, ..} if tool_use_id.as_deref()==Some("tu_1"))
+        );
+        assert!(matches!(blocks[3], TypedBlock::Thinking(ref t) if t=="let me think"));
+    }
+
+    #[test]
+    fn split_content_blocks_thinking_uses_anthropic_thinking_key() {
+        let v = json!([{"type":"thinking","thinking":"real reasoning","signature":"sig"}]);
+        let blocks = split_content_blocks(&v);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(blocks[0], TypedBlock::Thinking(ref t) if t=="real reasoning"));
+    }
+
+    #[test]
+    fn add_raw_role_inserts_reserved_string_without_touching_other_fields() {
+        let raw_envelope = json!({"source": "chatgpt"});
+        let projected_extra = json!({"existing": true});
+
+        let extra = add_raw_role(&raw_envelope, projected_extra, "assistant").unwrap();
+
+        assert_eq!(extra, json!({"existing": true, "raw_role": "assistant"}));
+        assert_eq!(raw_envelope, json!({"source": "chatgpt"}));
+    }
+
+    #[test]
+    fn add_raw_role_rejects_collision_in_raw_or_projected_extra_and_non_objects() {
+        let raw_collision = add_raw_role(
+            &json!({"raw_role": "original"}),
+            json!({"existing": true}),
+            "assistant",
+        )
+        .unwrap_err();
+        assert!(raw_collision.to_string().contains("raw_role"));
+
+        let projected_collision = add_raw_role(
+            &json!({"source": "chatgpt"}),
+            json!({"raw_role": "projected"}),
+            "assistant",
+        )
+        .unwrap_err();
+        assert!(projected_collision.to_string().contains("raw_role"));
+
+        assert!(add_raw_role(&json!([]), json!({}), "assistant").is_err());
+        assert!(add_raw_role(&json!({}), json!([]), "assistant").is_err());
+        assert!(add_raw_role(&json!({}), json!({}), "   ").is_err());
+    }
+
+    #[test]
+    fn set_tool_result_pairing_enforces_exactly_one_branch() {
+        let mut extra = json!({"tool_call_id": "old", "unpaired": true});
+
+        set_tool_result_pairing(&mut extra, Some(" call_1 ")).unwrap();
+        assert_eq!(
+            extra
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str),
+            Some("call_1")
+        );
+        assert!(extra.get("unpaired").is_none());
+        assert!(
+            extra.get("tool_call_id").is_some() ^ (extra.get("unpaired") == Some(&json!(true)))
+        );
+
+        set_tool_result_pairing(&mut extra, None).unwrap();
+        assert!(extra.get("tool_call_id").is_none());
+        assert_eq!(extra.get("unpaired"), Some(&json!(true)));
+        assert!(
+            extra.get("tool_call_id").is_some() ^ (extra.get("unpaired") == Some(&json!(true)))
+        );
+    }
+
+    #[test]
+    fn add_encrypted_content_rejects_type_duplicate_and_top_level_collision() {
+        let raw_envelope = json!({"source": "chatgpt"});
+        let mut extra = json!({"existing": true});
+        let encrypted = json!("opaque-secret-value");
+
+        add_encrypted_content(&raw_envelope, &mut extra, &encrypted).unwrap();
+        assert_eq!(extra["encrypted_content"], encrypted);
+
+        let duplicate = add_encrypted_content(&raw_envelope, &mut extra, &encrypted).unwrap_err();
+        assert!(duplicate.to_string().contains("encrypted_content"));
+
+        let raw_collision = add_encrypted_content(
+            &json!({"encrypted_content": "original"}),
+            &mut json!({}),
+            &encrypted,
+        )
+        .unwrap_err();
+        assert!(raw_collision.to_string().contains("encrypted_content"));
+
+        let projected_collision = add_encrypted_content(
+            &raw_envelope,
+            &mut json!({"encrypted_content": "projected"}),
+            &encrypted,
+        )
+        .unwrap_err();
+        assert!(
+            projected_collision
+                .to_string()
+                .contains("encrypted_content")
+        );
+
+        let numeric =
+            add_encrypted_content(&raw_envelope, &mut json!({}), &json!(123)).unwrap_err();
+        assert!(numeric.to_string().contains("encrypted_content"));
+        assert!(!numeric.to_string().contains("123"));
+
+        let object =
+            add_encrypted_content(&raw_envelope, &mut json!({}), &json!({"opaque": "secret"}))
+                .unwrap_err();
+        assert!(object.to_string().contains("encrypted_content"));
+        assert!(!object.to_string().contains("secret"));
     }
 }

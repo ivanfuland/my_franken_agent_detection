@@ -7,7 +7,10 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::utils::{
+    add_encrypted_content, add_raw_role, dedupe_path_key, env_path_nonempty,
+    set_tool_result_pairing,
+};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -127,11 +130,15 @@ impl CodexConnector {
 
     fn is_token_usage_target_message(message: &NormalizedMessage) -> bool {
         // Attribute token_count usage to concrete assistant turns only.
-        // This avoids attaching usage to synthetic reasoning helper messages.
-        message.role == "assistant" && message.author.is_none()
+        // This used to also require `author.is_none()` to exclude reasoning
+        // messages, which were previously masquerading as `role="assistant"`
+        // with `author=Some("reasoning")`. Now that reasoning has its own
+        // `role="reasoning"` (task 1.3), checking `role` alone is sufficient
+        // and correct even when a real model author is attached.
+        message.role == "assistant"
     }
 
-    fn token_usage_from_payload(payload: &Value) -> Option<Value> {
+    fn legacy_token_usage_from_payload(payload: &Value) -> Option<Value> {
         let input_tokens = payload.get("input_tokens").and_then(Value::as_i64);
         let output_tokens = payload
             .get("output_tokens")
@@ -152,6 +159,89 @@ impl CodexConnector {
         usage.insert("data_source".to_string(), Value::String("api".to_string()));
 
         Some(Value::Object(usage))
+    }
+
+    fn token_usage_from_payload(payload: &Value) -> Result<Option<Value>> {
+        let is_canonical = payload.get("info").is_some() || payload.get("rate_limits").is_some();
+        if !is_canonical {
+            let is_explicit_legacy = ["input_tokens", "output_tokens", "tokens"]
+                .iter()
+                .any(|key| payload.get(*key).is_some());
+            if !is_explicit_legacy {
+                anyhow::bail!("token_count payload matches neither canonical nor legacy shape");
+            }
+            return Ok(Self::legacy_token_usage_from_payload(payload));
+        }
+
+        let payload_object = payload
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("token_count payload must be an object"))?;
+        validate_exact_keys(
+            payload_object,
+            &["type", "info"],
+            &["rate_limits"],
+            "token_count payload",
+        )?;
+
+        // `rate_limits` is optional: real-world rollouts from early codex
+        // CLI builds (observed 2025-09, pre-dating this field) omit the key
+        // entirely rather than setting it to `null`. Treat an absent key
+        // the same as an explicit `null` -- both mean "no rate-limit info
+        // attached to this event".
+        let rate_limits = payload_object
+            .get("rate_limits")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let info = payload_object
+            .get("info")
+            .context("validated token_count payload lost info")?;
+        if info.is_null() {
+            if !rate_limits.is_object() {
+                anyhow::bail!("token_count rate_limits must be an object when info is null");
+            }
+            return Ok(None);
+        }
+        if !rate_limits.is_null() && !rate_limits.is_object() {
+            anyhow::bail!("token_count rate_limits must be an object or null");
+        }
+
+        let info_object = info
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("token_count info must be an object or null"))?;
+        validate_exact_keys(
+            info_object,
+            &[
+                "last_token_usage",
+                "model_context_window",
+                "total_token_usage",
+            ],
+            &[],
+            "token_count info",
+        )?;
+
+        let _context_window = info_object
+            .get("model_context_window")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "token_count model_context_window must be a finite non-negative number"
+                )
+            })?;
+        let mut last_usage = validate_token_usage_object(
+            info_object
+                .get("last_token_usage")
+                .context("validated token_count info lost last_token_usage")?,
+            "token_count last_token_usage",
+        )?;
+        validate_token_usage_object(
+            info_object
+                .get("total_token_usage")
+                .context("validated token_count info lost total_token_usage")?,
+            "token_count total_token_usage",
+        )?;
+        last_usage.insert("data_source".to_string(), Value::String("api".to_string()));
+        Ok(Some(Value::Object(last_usage)))
     }
 
     fn should_compact_large_message_extra(file_size_bytes: Option<u64>) -> bool {
@@ -296,6 +386,23 @@ impl CodexConnector {
         }
     }
 
+    fn normalized_message_extra(
+        raw_envelope: &Value,
+        compact_message_extra: bool,
+        raw_role: &str,
+    ) -> Result<Value> {
+        if raw_envelope.get("encrypted_content").is_some() {
+            anyhow::bail!("raw envelope already contains reserved key encrypted_content");
+        }
+
+        let projected_extra = if compact_message_extra {
+            Self::compact_message_extra(raw_envelope)
+        } else {
+            raw_envelope.clone()
+        };
+        add_raw_role(raw_envelope, projected_extra, raw_role)
+    }
+
     fn attach_token_usage_to_latest_assistant(
         messages: &mut [NormalizedMessage],
         token_usage: Value,
@@ -343,6 +450,71 @@ fn update_time_bounds(started_at: &mut Option<i64>, ended_at: &mut Option<i64>, 
     }
 }
 
+fn validate_exact_keys(
+    object: &serde_json::Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> Result<()> {
+    let valid_len = object.len() >= required.len()
+        && object.len() <= required.len().saturating_add(optional.len());
+    let has_required = required.iter().all(|key| object.contains_key(*key));
+    let only_allowed = object
+        .keys()
+        .all(|key| required.contains(&key.as_str()) || optional.contains(&key.as_str()));
+    if !valid_len || !has_required || !only_allowed {
+        anyhow::bail!("{label} has an unsupported key set");
+    }
+    Ok(())
+}
+
+fn validate_token_usage_object(
+    value: &Value,
+    label: &str,
+) -> Result<serde_json::Map<String, Value>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("{label} must be an object"))?;
+    validate_exact_keys(
+        object,
+        &[
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+        ],
+        &["cache_write_input_tokens"],
+        label,
+    )?;
+    for (key, token_value) in object {
+        if token_value.as_u64().is_none() {
+            anyhow::bail!("{label}.{key} must be a non-negative integer");
+        }
+    }
+    Ok(object.clone())
+}
+
+fn metadata_field_and_timestamp<'a>(
+    envelope: &'a Value,
+    entry_type: &str,
+    field: &str,
+) -> Result<(&'a str, Option<i64>)> {
+    let timestamp = envelope
+        .get("timestamp")
+        .filter(|value| value.is_string())
+        .ok_or_else(|| anyhow::anyhow!("{entry_type} timestamp must be a string"))?;
+    let payload = envelope
+        .get("payload")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("{entry_type} payload must be an object"))?;
+    let field_value = payload
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{entry_type} payload.{field} must be a string"))?;
+    Ok((field_value, parse_timestamp(timestamp)))
+}
+
 /// Parse the arguments of a modern Codex `response_item` tool call.
 ///
 /// `function_call` payloads carry `arguments` as a JSON-encoded string (e.g.
@@ -378,6 +550,98 @@ fn tool_output_text(payload: &Value) -> String {
         }
     }
     flatten_content(output)
+}
+
+/// Render a tool call's own content for display: `<name>(<args JSON>)`, or
+/// just `<name>` when there's no input. Mirrors `claude_code.rs`'s
+/// `render_tool_call_content` -- the full untruncated arguments always live
+/// in `extra["tool_call_args"]`/the invocation's `arguments` for exact
+/// reconstruction (never truncated -- spec §3.2).
+fn render_tool_call_content(name: &str, arguments: Option<&Value>) -> String {
+    match arguments {
+        Some(value) if !value.is_null() => format!("{name}({value})"),
+        _ => name.to_string(),
+    }
+}
+
+/// Extract plaintext reasoning text from a `response_item`/`reasoning`
+/// payload's `summary` array (`[{"type":"summary_text","text":"..."}]`).
+/// Returns empty when `summary` is absent/empty -- e.g. when the item is
+/// fully encrypted with no plaintext summary. Never touches
+/// `encrypted_content` (spec: do not attempt to decrypt it).
+fn reasoning_summary_text(payload: &Value) -> Result<String> {
+    let Some(summary) = payload.get("summary") else {
+        return Ok(String::new());
+    };
+    let items = summary
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("reasoning summary must be an array"))?;
+    let mut out = String::new();
+    for item in items {
+        let item = item
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("reasoning summary item must be an object"))?;
+        let item_type = item
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("reasoning summary item.type must be a string"))?;
+        if item_type != "summary_text" {
+            anyhow::bail!("reasoning summary item.type must be summary_text");
+        }
+        let text = item
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("reasoning summary_text.text must be a string"))?;
+        if text.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    }
+    Ok(out)
+}
+
+fn parse_agent_message_content(payload: &Value) -> Result<(String, Option<Value>)> {
+    let blocks = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("agent_message content must be an array"))?;
+    let mut visible = Vec::new();
+    let mut encrypted_content = None;
+    for block in blocks {
+        let block = block
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("agent_message content block must be an object"))?;
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("agent_message content block.type must be a string"))?;
+        match block_type {
+            "text" | "input_text" | "output_text" => {
+                let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    anyhow::anyhow!("agent_message visible text must be a string")
+                })?;
+                visible.push(text.to_string());
+            }
+            "encrypted_content" => {
+                if encrypted_content.is_some() {
+                    anyhow::bail!("agent_message has duplicate encrypted_content blocks");
+                }
+                let opaque = block.get("encrypted_content").ok_or_else(|| {
+                    anyhow::anyhow!("agent_message encrypted_content block is missing its value")
+                })?;
+                if !opaque.is_string() {
+                    anyhow::bail!("agent_message encrypted_content must be a string");
+                }
+                encrypted_content = Some(opaque.clone());
+            }
+            "input_image" | "refusal" => {}
+            _ => anyhow::bail!("agent_message content block.type is unsupported"),
+        }
+    }
+    Ok((visible.join("\n"), encrypted_content))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -456,6 +720,12 @@ fn scan_codex_with_callback(
             let mut started_at = None;
             let mut ended_at = None;
             let mut session_cwd: Option<PathBuf> = None;
+            // Model provenance for `author` on assistant/tool_call/reasoning
+            // messages (spec: author = model name for those roles). Real
+            // rollouts only ever carry `model` on `turn_context` payloads
+            // (never on `session_meta` or individual `message` items), so
+            // track the most recently seen one as turns progress.
+            let mut current_model: Option<String> = None;
 
             if ext == Some("jsonl") {
                 let f = std::fs::File::open(&file)
@@ -478,253 +748,334 @@ fn scan_codex_with_callback(
 
                     match entry_type {
                         "session_meta" => {
-                            if let Some(payload) = val.get("payload") {
-                                session_cwd = payload
-                                    .get("cwd")
-                                    .and_then(|v| v.as_str())
-                                    .map(PathBuf::from);
-                            }
-                            update_time_bounds(&mut started_at, &mut ended_at, created);
+                            let (cwd, metadata_created) =
+                                metadata_field_and_timestamp(&val, "session_meta", "cwd")?;
+                            session_cwd = Some(PathBuf::from(cwd));
+                            update_time_bounds(&mut started_at, &mut ended_at, metadata_created);
+                        }
+                        "turn_context" => {
+                            let (model, metadata_created) =
+                                metadata_field_and_timestamp(&val, "turn_context", "model")?;
+                            current_model = Some(model.to_string());
+                            update_time_bounds(&mut started_at, &mut ended_at, metadata_created);
                         }
                         "response_item" => {
-                            if let Some(payload) = val.get("payload") {
-                                let payload_type = payload.get("type").and_then(|v| v.as_str());
-
-                                match payload_type {
-                                    // Modern Codex encodes tool calls as
-                                    // `response_item` entries rather than
-                                    // `event_msg`/`tool_call`. `function_call`
-                                    // is a structured tool (e.g. `exec_command`);
-                                    // `custom_tool_call` is a freeform tool
-                                    // (e.g. `apply_patch`). Both lack a `content`
-                                    // field, so without explicit handling they
-                                    // flatten to empty and get dropped.
-                                    Some("function_call" | "custom_tool_call") => {
-                                        let tool_name = payload
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let arguments = parse_tool_call_arguments(payload);
-                                        let call_id = payload
-                                            .get("call_id")
-                                            .or_else(|| payload.get("id"))
-                                            .and_then(|v| v.as_str())
-                                            .map(String::from);
-
-                                        let content_text = format!("[Tool: {tool_name}]");
-                                        update_time_bounds(&mut started_at, &mut ended_at, created);
-                                        messages.push(NormalizedMessage {
-                                            idx: 0,
-                                            role: "assistant".to_string(),
-                                            author: None,
-                                            created_at: created,
-                                            content: content_text,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
-                                            invocations: vec![NormalizedInvocation {
-                                                kind: "tool".to_string(),
-                                                name: tool_name,
-                                                raw_name: None,
-                                                call_id,
-                                                arguments,
-                                            }],
-                                            snippets: Vec::new(),
-                                        });
+                            let Some(payload) = val.get("payload") else {
+                                continue;
+                            };
+                            let payload_type = match payload.get("type") {
+                                None => None,
+                                Some(Value::String(payload_type)) => Some(payload_type.as_str()),
+                                Some(_) => anyhow::bail!(
+                                    "response_item payload.type must be a string when present"
+                                ),
+                            };
+                            match payload_type {
+                                Some("message") | None => {
+                                    let Some(role @ ("user" | "assistant")) =
+                                        payload.get("role").and_then(Value::as_str)
+                                    else {
+                                        continue;
+                                    };
+                                    let content = payload
+                                        .get("content")
+                                        .map(flatten_content)
+                                        .unwrap_or_default();
+                                    if content.trim().is_empty() {
+                                        continue;
                                     }
-                                    // Tool results: `output` carries the captured
-                                    // stdout / patch summary. Emit as a
-                                    // first-class `tool` timeline entry; the
-                                    // linking `call_id` is preserved in `extra`.
-                                    Some("function_call_output" | "custom_tool_call_output") => {
-                                        let output_text = tool_output_text(payload);
-                                        if output_text.trim().is_empty() {
-                                            continue;
-                                        }
-                                        update_time_bounds(&mut started_at, &mut ended_at, created);
-                                        messages.push(NormalizedMessage {
-                                            idx: 0,
-                                            role: "tool".to_string(),
-                                            author: None,
-                                            created_at: created,
-                                            content: output_text,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
-                                            invocations: Vec::new(),
-                                            snippets: Vec::new(),
-                                        });
-                                    }
-                                    // Plain messages: assistant `output_text`,
-                                    // user/developer `input_text`, or legacy
-                                    // string content. Encrypted `reasoning`
-                                    // items have no plaintext content and are
-                                    // intentionally skipped here (plaintext
-                                    // reasoning arrives via `event_msg`).
-                                    _ => {
-                                        let role = payload
-                                            .get("role")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("agent");
-
-                                        let content_str = payload
-                                            .get("content")
-                                            .map(flatten_content)
-                                            .unwrap_or_default();
-
-                                        if content_str.trim().is_empty() {
-                                            continue;
-                                        }
-
-                                        update_time_bounds(&mut started_at, &mut ended_at, created);
-                                        let invocations = payload.get("content").map_or_else(
-                                            Vec::new,
-                                            extract_invocations_from_content_blocks,
-                                        );
-
-                                        messages.push(NormalizedMessage {
-                                            idx: 0,
-                                            role: role.to_string(),
-                                            author: None,
-                                            created_at: created,
-                                            content: content_str,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
-                                            invocations,
-                                            snippets: Vec::new(),
-                                        });
-                                    }
+                                    let extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        role,
+                                    )?;
+                                    let invocations = payload.get("content").map_or_else(
+                                        Vec::new,
+                                        extract_invocations_from_content_blocks,
+                                    );
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: role.to_string(),
+                                        author: (role == "assistant")
+                                            .then(|| current_model.clone())
+                                            .flatten(),
+                                        created_at: created,
+                                        content,
+                                        extra,
+                                        invocations,
+                                        snippets: Vec::new(),
+                                    });
                                 }
+                                Some("agent_message") => {
+                                    let (content, encrypted_content) =
+                                        parse_agent_message_content(payload)?;
+                                    if content.trim().is_empty() {
+                                        if let Some(encrypted_content) = encrypted_content.as_ref()
+                                        {
+                                            let mut validation_extra = if compact_message_extra {
+                                                CodexConnector::compact_message_extra(&val)
+                                            } else {
+                                                val.clone()
+                                            };
+                                            add_encrypted_content(
+                                                &val,
+                                                &mut validation_extra,
+                                                encrypted_content,
+                                            )?;
+                                        }
+                                        continue;
+                                    }
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "agent_message",
+                                    )?;
+                                    if let Some(encrypted_content) = encrypted_content.as_ref() {
+                                        add_encrypted_content(&val, &mut extra, encrypted_content)?;
+                                    }
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: "user".to_string(),
+                                        author: None,
+                                        created_at: created,
+                                        content,
+                                        extra,
+                                        invocations: Vec::new(),
+                                        snippets: Vec::new(),
+                                    });
+                                }
+                                Some("reasoning") => {
+                                    let content = reasoning_summary_text(payload)?;
+                                    let encrypted_content = payload.get("encrypted_content");
+                                    if content.trim().is_empty() && encrypted_content.is_none() {
+                                        continue;
+                                    }
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "reasoning",
+                                    )?;
+                                    if let Some(encrypted_content) = encrypted_content {
+                                        add_encrypted_content(&val, &mut extra, encrypted_content)?;
+                                    }
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: "reasoning".to_string(),
+                                        author: current_model.clone(),
+                                        created_at: created,
+                                        content,
+                                        extra,
+                                        invocations: Vec::new(),
+                                        snippets: Vec::new(),
+                                    });
+                                }
+                                Some(raw_role @ ("function_call" | "custom_tool_call")) => {
+                                    let tool_name = payload
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    let arguments = parse_tool_call_arguments(payload);
+                                    let call_id = payload
+                                        .get("call_id")
+                                        .or_else(|| payload.get("id"))
+                                        .and_then(Value::as_str)
+                                        .map(String::from);
+                                    let content =
+                                        render_tool_call_content(&tool_name, arguments.as_ref());
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        raw_role,
+                                    )?;
+                                    let extra_object = extra
+                                        .as_object_mut()
+                                        .context("codex tool-call extra must be an object")?;
+                                    if let Some(id) = call_id.as_ref() {
+                                        extra_object.insert(
+                                            "tool_call_id".to_string(),
+                                            Value::String(id.clone()),
+                                        );
+                                    }
+                                    extra_object.insert(
+                                        "tool_call_args".to_string(),
+                                        arguments.clone().unwrap_or(Value::Null),
+                                    );
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: "tool_call".to_string(),
+                                        author: current_model.clone(),
+                                        created_at: created,
+                                        content,
+                                        extra,
+                                        invocations: vec![NormalizedInvocation {
+                                            kind: "tool".to_string(),
+                                            name: tool_name,
+                                            raw_name: None,
+                                            call_id,
+                                            arguments,
+                                        }],
+                                        snippets: Vec::new(),
+                                    });
+                                }
+                                Some(
+                                    raw_role @ ("function_call_output" | "custom_tool_call_output"),
+                                ) => {
+                                    let content = tool_output_text(payload);
+                                    let call_id = payload
+                                        .get("call_id")
+                                        .and_then(Value::as_str)
+                                        .map(String::from);
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        raw_role,
+                                    )?;
+                                    set_tool_result_pairing(&mut extra, call_id.as_deref())?;
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: "tool_result".to_string(),
+                                        author: None,
+                                        created_at: created,
+                                        content,
+                                        extra,
+                                        invocations: Vec::new(),
+                                        snippets: Vec::new(),
+                                    });
+                                }
+                                Some(_) => {}
                             }
                         }
                         "event_msg" => {
-                            if let Some(payload) = val.get("payload") {
-                                let event_type = payload.get("type").and_then(|v| v.as_str());
-
-                                match event_type {
-                                    Some("user_message") => {
-                                        let text = payload
-                                            .get("message")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        if !text.is_empty() {
-                                            update_time_bounds(
-                                                &mut started_at,
-                                                &mut ended_at,
-                                                created,
-                                            );
-                                            messages.push(NormalizedMessage {
-                                                idx: 0,
-                                                role: "user".to_string(),
-                                                author: None,
-                                                created_at: created,
-                                                content: text.to_string(),
-                                                extra: if compact_message_extra {
-                                                    CodexConnector::compact_message_extra(&val)
-                                                } else {
-                                                    val
-                                                },
-                                                invocations: Vec::new(),
-                                                snippets: Vec::new(),
-                                            });
-                                        }
+                            let Some(payload) = val.get("payload") else {
+                                continue;
+                            };
+                            let event_type = payload.get("type").and_then(Value::as_str);
+                            // Event-layer agent messages duplicate the visible
+                            // response item and are structural noise.
+                            if event_type == Some("agent_message") {
+                                continue;
+                            }
+                            match event_type {
+                                Some("user_message") => {
+                                    let text = payload
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    if text.trim().is_empty() {
+                                        continue;
                                     }
-                                    Some("agent_reasoning") => {
-                                        let text = payload
-                                            .get("text")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        if !text.is_empty() {
-                                            update_time_bounds(
-                                                &mut started_at,
-                                                &mut ended_at,
-                                                created,
-                                            );
-                                            messages.push(NormalizedMessage {
-                                                idx: 0,
-                                                role: "assistant".to_string(),
-                                                author: Some("reasoning".to_string()),
-                                                created_at: created,
-                                                content: text.to_string(),
-                                                extra: if compact_message_extra {
-                                                    CodexConnector::compact_message_extra(&val)
-                                                } else {
-                                                    val
-                                                },
-                                                invocations: Vec::new(),
-                                                snippets: Vec::new(),
-                                            });
-                                        }
-                                    }
-                                    Some("tool_call") => {
-                                        // Codex event_msg/tool_call events carry structured
-                                        // tool data that should produce invocations.
-                                        let tool_name = payload
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let arguments = payload
-                                            .get("input")
-                                            .or_else(|| payload.get("arguments"))
-                                            .cloned();
-                                        let call_id = payload
-                                            .get("call_id")
-                                            .or_else(|| payload.get("id"))
-                                            .and_then(|v| v.as_str())
-                                            .map(String::from);
-
-                                        let content_text = format!("[Tool: {tool_name}]");
-                                        update_time_bounds(&mut started_at, &mut ended_at, created);
-                                        messages.push(NormalizedMessage {
-                                            idx: 0,
-                                            role: "assistant".to_string(),
-                                            author: None,
-                                            created_at: created,
-                                            content: content_text,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
-                                            invocations: vec![NormalizedInvocation {
-                                                kind: "tool".to_string(),
-                                                name: tool_name,
-                                                raw_name: None,
-                                                call_id,
-                                                arguments,
-                                            }],
-                                            snippets: Vec::new(),
-                                        });
-                                    }
-                                    Some("token_count") => {
-                                        if let Some(token_usage) =
-                                            CodexConnector::token_usage_from_payload(payload)
-                                        {
-                                            CodexConnector::attach_token_usage_to_latest_assistant(
-                                                &mut messages,
-                                                token_usage,
-                                                &source_path,
-                                                line_idx + 1,
-                                            );
-                                        } else {
-                                            tracing::debug!(
-                                                path = %source_path.display(),
-                                                line_number = line_idx + 1,
-                                                "codex token_count event missing token fields; skipping"
-                                            );
-                                        }
-                                    }
-                                    _ => {}
+                                    let extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "user_message",
+                                    )?;
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: "user".to_string(),
+                                        author: None,
+                                        created_at: created,
+                                        content: text.to_string(),
+                                        extra,
+                                        invocations: Vec::new(),
+                                        snippets: Vec::new(),
+                                    });
                                 }
+                                Some("agent_reasoning") => {
+                                    let text =
+                                        payload.get("text").and_then(Value::as_str).unwrap_or("");
+                                    if text.trim().is_empty() {
+                                        continue;
+                                    }
+                                    let extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "agent_reasoning",
+                                    )?;
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: "reasoning".to_string(),
+                                        author: current_model.clone(),
+                                        created_at: created,
+                                        content: text.to_string(),
+                                        extra,
+                                        invocations: Vec::new(),
+                                        snippets: Vec::new(),
+                                    });
+                                }
+                                Some("tool_call") => {
+                                    let tool_name = payload
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    let arguments = payload
+                                        .get("input")
+                                        .or_else(|| payload.get("arguments"))
+                                        .cloned();
+                                    let call_id = payload
+                                        .get("call_id")
+                                        .or_else(|| payload.get("id"))
+                                        .and_then(Value::as_str)
+                                        .map(String::from);
+                                    let content =
+                                        render_tool_call_content(&tool_name, arguments.as_ref());
+                                    let mut extra = CodexConnector::normalized_message_extra(
+                                        &val,
+                                        compact_message_extra,
+                                        "tool_call",
+                                    )?;
+                                    let extra_object = extra
+                                        .as_object_mut()
+                                        .context("codex event tool-call extra must be an object")?;
+                                    if let Some(id) = call_id.as_ref() {
+                                        extra_object.insert(
+                                            "tool_call_id".to_string(),
+                                            Value::String(id.clone()),
+                                        );
+                                    }
+                                    extra_object.insert(
+                                        "tool_call_args".to_string(),
+                                        arguments.clone().unwrap_or(Value::Null),
+                                    );
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: "tool_call".to_string(),
+                                        author: current_model.clone(),
+                                        created_at: created,
+                                        content,
+                                        extra,
+                                        invocations: vec![NormalizedInvocation {
+                                            kind: "tool".to_string(),
+                                            name: tool_name,
+                                            raw_name: None,
+                                            call_id,
+                                            arguments,
+                                        }],
+                                        snippets: Vec::new(),
+                                    });
+                                }
+                                Some("token_count") => {
+                                    if let Some(token_usage) =
+                                        CodexConnector::token_usage_from_payload(payload)?
+                                    {
+                                        CodexConnector::attach_token_usage_to_latest_assistant(
+                                            &mut messages,
+                                            token_usage,
+                                            &source_path,
+                                            line_idx + 1,
+                                        );
+                                    }
+                                }
+                                Some(_) | None => {}
                             }
                         }
                         _ => {}
@@ -858,6 +1209,16 @@ mod tests {
     use std::fs;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    fn scan_synthetic_jsonl(content: &str) -> Result<Vec<NormalizedConversation>> {
+        let dir = TempDir::new()?;
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions)?;
+        fs::write(sessions.join("rollout-synthetic.jsonl"), content)?;
+
+        CodexConnector::new().scan(&ScanContext::local_default(codex_dir, None))
+    }
 
     // =====================================================
     // Constructor Tests
@@ -1070,16 +1431,38 @@ mod tests {
         assert_eq!(conv.workspace, Some(PathBuf::from("/tmp/demo-project")));
 
         // user, assistant output_text, function_call, function_call_output,
-        // custom_tool_call, custom_tool_call_output = 6 messages. The encrypted
-        // reasoning item carries no plaintext content and is skipped.
+        // custom_tool_call, custom_tool_call_output, reasoning = 7 messages.
+        // The encrypted-only reasoning item is now EMITTED as an empty
+        // structural reasoning message (completeness policy), not skipped --
+        // its `encrypted_content` is preserved in `extra`.
         assert_eq!(
             conv.messages.len(),
-            6,
-            "all modern shapes captured (encrypted reasoning skipped): {:#?}",
+            7,
+            "all modern shapes captured (encrypted reasoning emitted): {:#?}",
             conv.messages
                 .iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect::<Vec<_>>()
+        );
+
+        // Encrypted-only reasoning: emitted with empty content, role
+        // `reasoning`, and its opaque `encrypted_content` preserved in extra.
+        let reasoning = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("encrypted-only reasoning item is emitted, not dropped");
+        assert!(
+            reasoning.content.is_empty(),
+            "encrypted-only reasoning has no plaintext content"
+        );
+        assert_eq!(
+            reasoning
+                .extra
+                .pointer("/payload/encrypted_content")
+                .and_then(|v| v.as_str()),
+            Some("gAAAAA-opaque-no-plaintext"),
+            "encrypted_content blob must be preserved in the reasoning message's extra"
         );
 
         // Assistant `output_text` is no longer dropped.
@@ -1093,12 +1476,15 @@ mod tests {
             .expect("assistant output_text message captured");
         assert!(assistant.invocations.is_empty());
 
-        // `function_call` -> tool invocation with JSON-string arguments parsed.
+        // `function_call` -> its own `tool_call` message (not inlined into
+        // assistant), with JSON-string arguments parsed and linkable via
+        // `extra["tool_call_id"]`.
         let exec = conv
             .messages
             .iter()
             .find(|m| m.invocations.iter().any(|i| i.name == "exec_command"))
             .expect("exec_command function_call captured");
+        assert_eq!(exec.role, "tool_call");
         let exec_inv = &exec.invocations[0];
         assert_eq!(exec_inv.kind, "tool");
         assert_eq!(exec_inv.call_id.as_deref(), Some("call_1"));
@@ -1111,28 +1497,34 @@ mod tests {
             Some("ls"),
             "JSON-string arguments are decoded into structured JSON"
         );
+        assert_eq!(exec.extra["tool_call_id"].as_str(), Some("call_1"));
 
-        // `function_call_output` -> tool result, linkable via call_id in extra.
+        // `function_call_output` -> `tool_result` (P0 rename from `tool`,
+        // which the downstream adapter mistook for a tool call), linkable via
+        // `extra["tool_call_id"]` -- the same key/value as its `tool_call`.
         let exec_out = conv
             .messages
             .iter()
-            .find(|m| m.role == "tool" && m.content.contains("README.md"))
-            .expect("function_call_output captured as tool result");
+            .find(|m| m.role == "tool_result" && m.content.contains("README.md"))
+            .expect("function_call_output captured as tool_result");
         assert_eq!(
-            exec_out
-                .extra
-                .pointer("/payload/call_id")
-                .and_then(|v| v.as_str()),
+            exec_out.extra["tool_call_id"].as_str(),
             Some("call_1"),
-            "tool result remains linkable to its originating call"
+            "tool_result remains linkable to its originating tool_call via extra[\"tool_call_id\"]"
+        );
+        assert_eq!(
+            exec_out.extra["tool_call_id"], exec.extra["tool_call_id"],
+            "tool_call and tool_result pair on the same tool_call_id"
         );
 
-        // `custom_tool_call` (apply_patch) -> tool invocation; freeform input kept.
+        // `custom_tool_call` (apply_patch) -> its own `tool_call` message;
+        // freeform input kept.
         let patch = conv
             .messages
             .iter()
             .find(|m| m.invocations.iter().any(|i| i.name == "apply_patch"))
             .expect("apply_patch custom_tool_call captured");
+        assert_eq!(patch.role, "tool_call");
         let patch_inv = &patch.invocations[0];
         assert_eq!(patch_inv.call_id.as_deref(), Some("call_2"));
         assert!(
@@ -1144,12 +1536,236 @@ mod tests {
             "non-JSON tool input is retained as a raw string"
         );
 
-        // `custom_tool_call_output` -> tool result message.
+        // `custom_tool_call_output` -> `tool_result` message.
         assert!(
             conv.messages
                 .iter()
-                .any(|m| m.role == "tool" && m.content.contains("A hello.txt")),
-            "custom_tool_call_output captured as tool result"
+                .any(|m| m.role == "tool_result" && m.content.contains("A hello.txt")),
+            "custom_tool_call_output captured as tool_result"
+        );
+
+        // No message uses a pre-6-role name.
+        assert!(
+            conv.messages
+                .iter()
+                .all(|m| !matches!(m.role.as_str(), "agent" | "tool" | "developer")),
+            "roles: {:?}",
+            conv.messages.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+    }
+
+    // =========================================================================
+    // 6-role normalization tests (franken fork, spec §3.3 codex)
+    // =========================================================================
+
+    #[test]
+    fn scan_codex_normalizes_to_six_role_messages() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Real Codex rollout shapes (verified against ~/.codex/sessions/**/*.jsonl):
+        // turn_context carries `model`; developer/user/assistant `message`
+        // items; a `reasoning` item with plaintext `summary`; a paired
+        // `function_call`/`function_call_output`.
+        let content = concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/codex-demo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex, a coding agent."}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"List the files in this repo."}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"I should run ls to see what's here."}],"encrypted_content":"gAAAAA-opaque"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"ls -la\",\"workdir\":\"/tmp/codex-demo\"}","call_id":"call_1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"total 8\ndrwxr-xr-x  2 user user 4096 Jan  1 00:00 .\n-rw-r--r--  1 user user   12 Jan  1 00:00 README.md\n"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:07Z","type":"response_item","payload":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"I found README.md in the directory."}]}}"#,
+            "\n",
+        );
+        fs::write(sessions.join("rollout-six-role.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+
+        let developer_emitted_count = conv
+            .messages
+            .iter()
+            .filter(|message| message.content == "You are Codex, a coding agent.")
+            .count();
+        assert_eq!(developer_emitted_count, 0);
+
+        // function_call -> its own tool_call message, args non-empty.
+        let tool_call = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call")
+            .expect("tool_call message");
+        assert!(
+            tool_call.invocations[0].arguments.is_some(),
+            "tool_call must carry non-empty args from function_call.arguments"
+        );
+        assert_eq!(
+            tool_call.invocations[0]
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("cmd"))
+                .and_then(|v| v.as_str()),
+            Some("ls -la")
+        );
+        let tool_call_id = tool_call
+            .extra
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .expect("tool_call extra[\"tool_call_id\"] must be set");
+        assert_eq!(tool_call_id, "call_1");
+
+        // function_call_output -> role tool_result (P0 rename from "tool"),
+        // full untruncated output, paired to the tool_call via tool_call_id.
+        let tool_result = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("tool_result message");
+        assert_eq!(
+            tool_result.content,
+            "total 8\ndrwxr-xr-x  2 user user 4096 Jan  1 00:00 .\n-rw-r--r--  1 user user   12 Jan  1 00:00 README.md\n",
+            "tool_result content must be the FULL output, never truncated/replaced with [tool call]"
+        );
+        assert_eq!(
+            tool_result
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some(tool_call_id),
+            "tool_result pairs to its tool_call via extra[\"tool_call_id\"], not content order"
+        );
+
+        // reasoning -> role reasoning, author is the real model (not the
+        // literal string "reasoning", and not empty since the model is known).
+        let reasoning = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("reasoning message");
+        assert_eq!(reasoning.content, "I should run ls to see what's here.");
+        assert_ne!(reasoning.author.as_deref(), Some("reasoning"));
+        assert_eq!(reasoning.author.as_deref(), Some("gpt-5.5"));
+
+        // No message anywhere uses a pre-6-role name.
+        assert!(
+            conv.messages
+                .iter()
+                .all(|m| !matches!(m.role.as_str(), "agent" | "tool" | "developer")),
+            "roles: {:?}",
+            conv.messages.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+
+        // idx must be contiguous 0..N.
+        assert!(
+            conv.messages
+                .iter()
+                .enumerate()
+                .all(|(i, m)| m.idx as usize == i)
+        );
+    }
+
+    #[test]
+    fn scan_emits_empty_tool_result_and_preserves_pairing() {
+        // Completeness policy (uniform with claude_code.rs): a command that
+        // succeeds with no stdout produces a legitimate EMPTY tool_result --
+        // it must still be emitted (not dropped), so the tool_call<->tool_result
+        // pairing chain via `extra["tool_call_id"]` survives.
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"true\"}","call_id":"call_empty"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"type":"function_call_output","call_id":"call_empty","output":""}}
+"#;
+        fs::write(sessions.join("rollout-empty-output.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let tool_result = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("empty function_call_output must still be emitted as a tool_result");
+        assert_eq!(
+            tool_result.content, "",
+            "empty output stays empty, not dropped"
+        );
+        assert_eq!(
+            tool_result
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some("call_empty"),
+            "pairing to the tool_call must survive even with empty output"
+        );
+    }
+
+    #[test]
+    fn scan_emits_encrypted_only_reasoning_and_preserves_blob() {
+        // Completeness policy: ~99.99% of real codex reasoning items are
+        // encrypted-only (empty `summary`, opaque `encrypted_content`). They
+        // must be emitted as empty structural reasoning messages, preserving
+        // `encrypted_content` in `extra` (never decrypted).
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"turn_context","timestamp":"2025-12-01T09:59:59Z","payload":{"model":"gpt-5.5"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAAAA-secret-blob"}}
+"#;
+        fs::write(sessions.join("rollout-encrypted-reasoning.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let reasoning = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.role == "reasoning")
+            .expect("encrypted-only reasoning must still be emitted, not dropped");
+        assert!(
+            reasoning.content.is_empty(),
+            "encrypted-only reasoning has empty content"
+        );
+        assert_eq!(reasoning.author.as_deref(), Some("gpt-5.5"));
+        // Non-compact path: the whole payload is carried, so the blob is
+        // reachable under /payload.
+        assert_eq!(
+            reasoning
+                .extra
+                .pointer("/payload/encrypted_content")
+                .and_then(|v| v.as_str()),
+            Some("gAAAAA-secret-blob"),
+            "encrypted_content must survive in the reasoning message's extra"
+        );
+        assert_eq!(
+            reasoning
+                .extra
+                .get("encrypted_content")
+                .and_then(|v| v.as_str()),
+            Some("gAAAAA-secret-blob"),
+            "encrypted_content must also use the normalized top-level field"
         );
     }
 
@@ -1387,7 +2003,11 @@ mod tests {
         let sessions = codex_dir.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
 
-        let content = r#"{"type":"event_msg","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"agent_reasoning","text":"Let me think about this..."}}
+        // `turn_context.model` precedes the reasoning event, like real
+        // rollouts, so `author` reflects the real model instead of the old
+        // literal `"reasoning"` mislabeling.
+        let content = r#"{"type":"turn_context","timestamp":"2025-12-01T09:59:59Z","payload":{"model":"gpt-5.5"}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"agent_reasoning","text":"Let me think about this..."}}
 "#;
         fs::write(sessions.join("rollout-reasoning.jsonl"), content).unwrap();
 
@@ -1397,8 +2017,8 @@ mod tests {
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
-        assert_eq!(convs[0].messages[0].role, "assistant");
-        assert_eq!(convs[0].messages[0].author, Some("reasoning".to_string()));
+        assert_eq!(convs[0].messages[0].role, "reasoning");
+        assert_eq!(convs[0].messages[0].author, Some("gpt-5.5".to_string()));
         assert_eq!(convs[0].messages[0].content, "Let me think about this...");
         assert!(convs[0].started_at.is_some());
         assert!(convs[0].ended_at.is_some());
@@ -1502,7 +2122,7 @@ not valid json at all
         let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Real message"}}
 {"type":"event_msg","timestamp":"2025-12-01T10:00:01Z","payload":{"type":"token_count","tokens":100}}
 {"type":"event_msg","timestamp":"2025-12-01T10:00:02Z","payload":{"type":"turn_aborted"}}
-{"type":"turn_context","timestamp":"2025-12-01T10:00:03Z","payload":{}}
+{"type":"turn_context","timestamp":"2025-12-01T10:00:03Z","payload":{"model":"gpt-synthetic"}}
 "#;
         fs::write(sessions.join("rollout-unknown.jsonl"), content).unwrap();
 
@@ -1667,6 +2287,57 @@ not valid json at all
                 .pointer("/cass/token_usage/output_tokens")
                 .and_then(Value::as_i64),
             Some(14)
+        );
+    }
+
+    #[test]
+    fn scan_attaches_token_count_to_assistant_with_model_author() {
+        // Regression guard for the `is_token_usage_target_message` change
+        // (`author.is_none()` -> `role == "assistant"`). Real rollouts carry
+        // a `turn_context.model`, so real assistant messages get
+        // `author = Some(model)`. The OLD guard required `author.is_none()`
+        // and would therefore SKIP attaching token usage to every real
+        // assistant turn -- yet every other token-usage test uses a fixture
+        // with no `turn_context`, so `author` stays `None` and the old buggy
+        // guard passes them. This test includes a `turn_context` line so the
+        // assistant has a real model author, proving token usage still
+        // attaches.
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"turn_context","timestamp":"2025-12-01T09:59:59Z","payload":{"model":"gpt-5.5"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Question"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"assistant","content":"Answer"}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:02Z","payload":{"type":"token_count","input_tokens":13,"output_tokens":21}}
+"#;
+        fs::write(sessions.join("rollout-token-model-author.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let assistant = &convs[0].messages[1];
+        assert_eq!(assistant.content, "Answer");
+        // The assistant carries the real model as its author -- exactly the
+        // case the old guard would have excluded.
+        assert_eq!(assistant.author.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            assistant
+                .extra
+                .pointer("/cass/token_usage/input_tokens")
+                .and_then(Value::as_i64),
+            Some(13),
+            "token usage must still attach to a real assistant turn that has a model author"
+        );
+        assert_eq!(
+            assistant
+                .extra
+                .pointer("/cass/token_usage/output_tokens")
+                .and_then(Value::as_i64),
+            Some(21)
         );
     }
 
@@ -2038,8 +2709,8 @@ not valid json at all
         fs::create_dir_all(&sessions).unwrap();
 
         // Only metadata, no actual messages
-        let content = r#"{"type":"session_meta","payload":{"cwd":"/test"}}
-{"type":"turn_context","payload":{}}
+        let content = r#"{"type":"session_meta","timestamp":"2025-12-01T10:00:00Z","payload":{"cwd":"/test"}}
+{"type":"turn_context","timestamp":"2025-12-01T10:00:01Z","payload":{"model":"gpt-synthetic"}}
 "#;
         fs::write(sessions.join("rollout-no-msgs.jsonl"), content).unwrap();
 
@@ -2085,7 +2756,7 @@ not valid json at all
     }
 
     #[test]
-    fn scan_uses_default_role_when_missing() {
+    fn scan_drops_modern_response_item_without_type_or_role() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
         let sessions = codex_dir.join("sessions");
@@ -2100,9 +2771,944 @@ not valid json at all
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs.len(), 1);
-        // Default role should be "agent"
-        assert_eq!(convs[0].messages[0].role, "agent");
+        assert!(convs.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scan_codex_response_item_and_event_msg_role_matrix() {
+        let content = concat!(
+            r#"{"type":"session_meta","timestamp":"2026-07-23T00:00:00Z","payload":{"cwd":"/tmp/synthetic-codex"}}"#,
+            "\n",
+            r#"{"type":"turn_context","timestamp":"2026-07-23T00:00:01Z","payload":{"model":"gpt-synthetic"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:02Z","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"drop developer"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:03Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"modern user"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:04Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"modern assistant"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:05Z","payload":{"role":"user","content":"legacy user"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:06Z","payload":{"role":"assistant","content":"legacy assistant"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:07Z","payload":{"content":"unclassifiable"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:08Z","payload":{"type":"agent_message","content":[{"type":"input_text","text":"agent input"},{"type":"text","text":"agent text"},{"type":"output_text","text":"agent output"},{"type":"encrypted_content","encrypted_content":"opaque-agent"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:09Z","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"visible reasoning"}],"content":[{"type":"text","text":"wrong reasoning source"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:10Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"true\"}","call_id":"call-1"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:11Z","payload":{"type":"custom_tool_call","name":"apply_patch","input":"synthetic patch","call_id":"call-2"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:12Z","payload":{"type":"function_call_output","call_id":"call-1","output":""}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:13Z","payload":{"type":"custom_tool_call_output","output":"unpaired output"}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:14Z","payload":{"type":"user_message","message":"event user"}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:15Z","payload":{"type":"agent_reasoning","text":"event reasoning"}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:16Z","payload":{"type":"tool_call","name":"event_tool","input":{"value":1},"call_id":"event-call"}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:17Z","payload":{"type":"agent_message","message":"drop event agent"}}"#,
+            "\n",
+        );
+
+        let convs = scan_synthetic_jsonl(content).unwrap();
+        let conv = &convs[0];
+        let developer_emitted_count = conv
+            .messages
+            .iter()
+            .filter(|message| message.content == "drop developer")
+            .count();
+        assert_eq!(developer_emitted_count, 0);
+        assert!(
+            conv.messages
+                .iter()
+                .all(|message| message.content != "unclassifiable")
+        );
+
+        for (content, role, raw_role) in [
+            ("modern user", "user", "user"),
+            ("modern assistant", "assistant", "assistant"),
+            ("legacy user", "user", "user"),
+            ("legacy assistant", "assistant", "assistant"),
+            ("visible reasoning", "reasoning", "reasoning"),
+            ("event user", "user", "user_message"),
+            ("event reasoning", "reasoning", "agent_reasoning"),
+        ] {
+            let message = conv
+                .messages
+                .iter()
+                .find(|message| message.content == content)
+                .unwrap_or_else(|| panic!("missing {content}"));
+            assert_eq!(message.role, role);
+            assert_eq!(message.extra["raw_role"], raw_role);
+        }
+
+        let agent_message = conv
+            .messages
+            .iter()
+            .find(|message| message.content.contains("agent input"))
+            .expect("visible response_item agent_message");
+        assert_eq!(
+            (
+                agent_message.role.as_str(),
+                agent_message.extra["raw_role"].as_str()
+            ),
+            ("user", Some("agent_message"))
+        );
+        assert!(agent_message.content.contains("agent text"));
+        assert!(agent_message.content.contains("agent output"));
+        assert_eq!(
+            agent_message.extra["encrypted_content"].as_str(),
+            Some("opaque-agent")
+        );
+
+        let reasoning = conv
+            .messages
+            .iter()
+            .find(|message| message.content == "visible reasoning")
+            .unwrap();
+        assert!(!reasoning.content.contains("wrong reasoning source"));
+        assert_eq!(reasoning.author.as_deref(), Some("gpt-synthetic"));
+
+        for (name, raw_role) in [
+            ("exec_command", "function_call"),
+            ("apply_patch", "custom_tool_call"),
+            ("event_tool", "tool_call"),
+        ] {
+            let message = conv
+                .messages
+                .iter()
+                .find(|message| message.invocations.iter().any(|item| item.name == name))
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(message.role, "tool_call");
+            assert_eq!(message.extra["raw_role"], raw_role);
+            assert_eq!(message.author.as_deref(), Some("gpt-synthetic"));
+        }
+
+        let paired = conv
+            .messages
+            .iter()
+            .find(|message| message.role == "tool_result" && message.content.is_empty())
+            .expect("empty paired result retained");
+        assert_eq!(paired.extra["raw_role"], "function_call_output");
+        assert_eq!(paired.extra["tool_call_id"], "call-1");
+        assert!(paired.extra.get("unpaired").is_none());
+
+        let unpaired = conv
+            .messages
+            .iter()
+            .find(|message| message.content == "unpaired output")
+            .expect("missing-id result retained");
+        assert_eq!(unpaired.extra["raw_role"], "custom_tool_call_output");
+        assert_eq!(unpaired.extra["unpaired"], true);
+        assert!(unpaired.extra.get("tool_call_id").is_none());
+
+        assert!(
+            conv.messages
+                .iter()
+                .all(|message| message.content != "drop event agent")
+        );
+        assert!(
+            conv.messages
+                .iter()
+                .enumerate()
+                .all(|(idx, message)| i64::try_from(idx) == Ok(message.idx))
+        );
+    }
+
+    #[test]
+    fn scan_codex_agent_message_metadata_only_blocks_do_not_emit() {
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"opaque-only"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"agent_message","content":[{"type":"input_image","image_url":"synthetic://image"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:02Z","payload":{"type":"agent_message","content":[{"type":"refusal","refusal":"synthetic refusal"}]}}"#,
+            "\n",
+        );
+        assert!(scan_synthetic_jsonl(content).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_codex_review_encrypted_only_agent_message_rejects_reserved_field_collision() {
+        let content = r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"collision","payload":{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"opaque"}]}}"#;
+        let error = scan_synthetic_jsonl(content).unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"), "{error:#}");
+    }
+
+    #[test]
+    fn scan_codex_visible_agent_message_rejects_top_level_encrypted_content_collision() {
+        let collision_value = "must-not-appear-in-errors-small-agent";
+        let content = format!(
+            r#"{{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"{collision_value}","payload":{{"type":"agent_message","content":[{{"type":"text","text":"visible agent"}}]}}}}"#
+        );
+
+        let error = scan_synthetic_jsonl(&content).unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"), "{error:#}");
+        assert!(!error.to_string().contains(collision_value), "{error:#}");
+    }
+
+    #[test]
+    fn scan_codex_visible_reasoning_rejects_top_level_encrypted_content_collision() {
+        let collision_value = "must-not-appear-in-errors-reasoning";
+        let content = format!(
+            r#"{{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"{collision_value}","payload":{{"type":"reasoning","summary":[{{"type":"summary_text","text":"visible reasoning"}}]}}}}"#
+        );
+
+        let error = scan_synthetic_jsonl(&content).unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"), "{error:#}");
+        assert!(!error.to_string().contains(collision_value), "{error:#}");
+    }
+
+    #[test]
+    fn scan_codex_visible_agent_and_reasoning_without_collision_are_retained() {
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{"type":"text","text":"visible agent"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"visible reasoning"}]}}"#,
+            "\n",
+        );
+
+        let convs = scan_synthetic_jsonl(content).unwrap();
+        let messages = &convs[0].messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            (
+                messages[0].role.as_str(),
+                messages[0].content.as_str(),
+                messages[0].extra["raw_role"].as_str()
+            ),
+            ("user", "visible agent", Some("agent_message"))
+        );
+        assert_eq!(
+            (
+                messages[1].role.as_str(),
+                messages[1].content.as_str(),
+                messages[1].extra["raw_role"].as_str()
+            ),
+            ("reasoning", "visible reasoning", Some("reasoning"))
+        );
+    }
+
+    #[test]
+    fn scan_codex_all_modern_retained_branches_reject_top_level_encrypted_content_collision() {
+        let collision_value = "must-not-appear-in-retained-branch-errors";
+        let cases = [
+            (
+                "response user message",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"message","role":"user","content":"visible user"}}"#,
+            ),
+            (
+                "response assistant message",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"message","role":"assistant","content":"visible assistant"}}"#,
+            ),
+            (
+                "response agent message",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"agent_message","content":[{"type":"text","text":"visible agent"}]}}"#,
+            ),
+            (
+                "response reasoning",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"visible reasoning"}]}}"#,
+            ),
+            (
+                "response function call",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-1"}}"#,
+            ),
+            (
+                "response custom tool call",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"custom_tool_call","name":"apply_patch","input":"patch","call_id":"call-2"}}"#,
+            ),
+            (
+                "response function output",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"function_call_output","call_id":"call-1","output":"result"}}"#,
+            ),
+            (
+                "response custom tool output",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"custom_tool_call_output","call_id":"call-2","output":"result"}}"#,
+            ),
+            (
+                "event user message",
+                r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"user_message","message":"visible event user"}}"#,
+            ),
+            (
+                "event agent reasoning",
+                r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"agent_reasoning","text":"visible event reasoning"}}"#,
+            ),
+            (
+                "event tool call",
+                r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"must-not-appear-in-retained-branch-errors","payload":{"type":"tool_call","name":"event_tool","input":{"value":1},"call_id":"event-call"}}"#,
+            ),
+        ];
+
+        let violations = cases
+            .into_iter()
+            .filter_map(|(case, content)| match scan_synthetic_jsonl(content) {
+                Err(error)
+                    if error.to_string().contains("encrypted_content")
+                        && !error.to_string().contains(collision_value) =>
+                {
+                    None
+                }
+                Err(error) => Some(format!("{case}: wrong error: {error:#}")),
+                Ok(_) => Some(format!("{case}: unexpectedly accepted")),
+            })
+            .collect::<Vec<_>>();
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn scan_codex_dropped_agent_messages_without_semantic_opaque_ignore_top_level_name() {
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"not-normalized","payload":{"type":"agent_message","content":[{"type":"text","text":"  \n\t  "}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:01Z","encrypted_content":"not-normalized","payload":{"type":"agent_message","content":[{"type":"input_image","image_url":"synthetic://image"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:02Z","encrypted_content":"not-normalized","payload":{"type":"agent_message","content":[{"type":"refusal","refusal":"synthetic refusal"}]}}"#,
+            "\n",
+        );
+
+        assert!(scan_synthetic_jsonl(content).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_codex_review_present_non_string_response_item_type_fails_closed() {
+        let violations = [("null", "null"), ("number", "7")]
+            .into_iter()
+            .filter_map(|(case, payload_type)| {
+                let content = format!(
+                    r#"{{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{{"type":{payload_type},"role":"user","content":"must not enter legacy fallback"}}}}"#
+                );
+                match scan_synthetic_jsonl(&content) {
+                    Err(error) if error.to_string().contains("payload.type") => None,
+                    Err(error) => Some(format!("{case}: wrong error: {error:#}")),
+                    Ok(_) => Some(format!("{case}: unexpectedly accepted")),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn scan_codex_review_reasoning_without_summary_or_encrypted_content_does_not_emit() {
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"reasoning"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"reasoning","summary":[]}}"#,
+            "\n",
+        );
+        assert!(scan_synthetic_jsonl(content).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_codex_review_reasoning_summary_shape_fails_closed() {
+        let cases = [
+            (
+                "wrong container",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"reasoning","summary":{}}}"#,
+            ),
+            (
+                "non-object item",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"reasoning","summary":[7]}}"#,
+            ),
+            (
+                "missing item type",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"reasoning","summary":[{"text":"hidden"}]}}"#,
+            ),
+            (
+                "non-string item type",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"reasoning","summary":[{"type":null,"text":"hidden"}]}}"#,
+            ),
+            (
+                "unknown item type",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"reasoning","summary":[{"type":"unknown","text":"hidden"}]}}"#,
+            ),
+            (
+                "non-string summary text",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":7}]}}"#,
+            ),
+        ];
+        let violations = cases
+            .into_iter()
+            .filter_map(|(case, content)| match scan_synthetic_jsonl(content) {
+                Err(error) if error.to_string().contains("reasoning summary") => None,
+                Err(error) => Some(format!("{case}: wrong error: {error:#}")),
+                Ok(_) => Some(format!("{case}: unexpectedly accepted")),
+            })
+            .collect::<Vec<_>>();
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn scan_codex_review_encrypted_only_reasoning_is_retained() {
+        let content = r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"reasoning","encrypted_content":"opaque"}}"#;
+        let convs = scan_synthetic_jsonl(content).unwrap();
+        let message = &convs[0].messages[0];
+        assert_eq!(message.role, "reasoning");
+        assert!(message.content.is_empty());
+        assert_eq!(message.extra["encrypted_content"], "opaque");
+    }
+
+    #[test]
+    fn scan_codex_review_agent_message_block_shape_fails_closed() {
+        let cases = [
+            (
+                "non-object block",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[7]}}"#,
+            ),
+            (
+                "missing block type",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{}]}}"#,
+            ),
+            (
+                "non-string block type",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{"type":null}]}}"#,
+            ),
+            (
+                "unknown block type",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{"type":"unknown"}]}}"#,
+            ),
+            (
+                "non-string visible text",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{"type":"text","text":7}]}}"#,
+            ),
+            (
+                "visible plus malformed block",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{"type":"text","text":"visible"},{"type":"unknown"}]}}"#,
+            ),
+        ];
+        let violations = cases
+            .into_iter()
+            .filter_map(|(case, content)| match scan_synthetic_jsonl(content) {
+                Err(error) if error.to_string().contains("agent_message") => None,
+                Err(error) => Some(format!("{case}: wrong error: {error:#}")),
+                Ok(_) => Some(format!("{case}: unexpectedly accepted")),
+            })
+            .collect::<Vec<_>>();
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn scan_codex_agent_message_encrypted_content_fails_loud() {
+        let cases = [
+            (
+                "duplicate",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{"type":"text","text":"visible"},{"type":"encrypted_content","encrypted_content":"one"},{"type":"encrypted_content","encrypted_content":"two"}]}}"#,
+            ),
+            (
+                "wrong type",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"agent_message","content":[{"type":"text","text":"visible"},{"type":"encrypted_content","encrypted_content":7}]}}"#,
+            ),
+            (
+                "raw collision",
+                r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","encrypted_content":"collision","payload":{"type":"agent_message","content":[{"type":"text","text":"visible"},{"type":"encrypted_content","encrypted_content":"opaque"}]}}"#,
+            ),
+        ];
+
+        for (case, content) in cases {
+            let error = scan_synthetic_jsonl(content).unwrap_err();
+            assert!(
+                error.to_string().contains("encrypted_content"),
+                "{case}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_codex_reasoning_encrypted_content_requires_string() {
+        let content = r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"reasoning","summary":[],"encrypted_content":{"opaque":"wrong"}}}"#;
+        let error = scan_synthetic_jsonl(content).unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"));
+    }
+
+    #[test]
+    fn scan_codex_event_plaintext_whitespace_is_dropped() {
+        let content = concat!(
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"user_message","message":"  \n\t  "}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"agent_reasoning","text":" \t "}}"#,
+            "\n",
+        );
+        assert!(scan_synthetic_jsonl(content).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_codex_canonical_token_count_attaches_last_usage() {
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"cached_input_tokens":1,"cache_write_input_tokens":3,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21},"model_context_window":128000,"total_token_usage":{"input_tokens":700,"cached_input_tokens":100,"output_tokens":1100,"reasoning_output_tokens":200,"total_tokens":2100}},"rate_limits":null}}"#,
+            "\n",
+        );
+
+        let convs = scan_synthetic_jsonl(content).unwrap();
+        let assistant = &convs[0].messages[0];
+        assert_eq!(assistant.extra["cass"]["token_usage"]["input_tokens"], 7);
+        assert_eq!(assistant.extra["cass"]["token_usage"]["output_tokens"], 11);
+        assert_eq!(
+            assistant.extra["cass"]["token_usage"]["cached_input_tokens"],
+            1
+        );
+        assert_eq!(
+            assistant.extra["cass"]["token_usage"]["cache_write_input_tokens"],
+            3
+        );
+        assert_eq!(assistant.extra["cass"]["token_usage"]["total_tokens"], 21);
+        assert_eq!(assistant.extra["cass"]["token_usage"]["data_source"], "api");
+    }
+
+    #[test]
+    fn scan_codex_legacy_token_count_without_rate_limits_key_attaches_usage() {
+        // Shape anchored to a real-world corpus sample, not invented from
+        // reading this implementation (fad-fork EXEC discipline): a python
+        // scan of 83 real codex rollout files found 7 files / 101
+        // token_count events (all dated 2025-09-17, an early codex CLI
+        // build) whose `payload` is exactly `{type, info}` -- `rate_limits`
+        // is not present as a key at all, not even `null`. Values below are
+        // fully synthetic; only the key-set shape is real.
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"cached_input_tokens":1,"cache_write_input_tokens":3,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21},"model_context_window":128000,"total_token_usage":{"input_tokens":700,"cached_input_tokens":100,"output_tokens":1100,"reasoning_output_tokens":200,"total_tokens":2100}}}}"#,
+            "\n",
+        );
+
+        let convs = scan_synthetic_jsonl(content).unwrap();
+        let assistant = &convs[0].messages[0];
+        assert_eq!(assistant.extra["cass"]["token_usage"]["input_tokens"], 7);
+        assert_eq!(assistant.extra["cass"]["token_usage"]["output_tokens"], 11);
+        assert_eq!(assistant.extra["cass"]["token_usage"]["total_tokens"], 21);
+        assert_eq!(assistant.extra["cass"]["token_usage"]["data_source"], "api");
+    }
+
+    #[test]
+    fn scan_codex_rate_limit_only_token_count_does_not_invent_usage() {
+        let content = concat!(
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:00Z","payload":{"type":"message","role":"assistant","content":"answer"}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":12.5}}}}"#,
+            "\n",
+        );
+        let convs = scan_synthetic_jsonl(content).unwrap();
+        assert!(
+            convs[0].messages[0]
+                .extra
+                .pointer("/cass/token_usage")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scan_codex_canonical_token_count_rejects_malformed_shapes() {
+        let valid_usage = r#"{"input_tokens":7,"cached_input_tokens":1,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21}"#;
+        let cases = [
+            (
+                "neither canonical nor legacy",
+                r#"{"type":"token_count"}"#.to_string(),
+            ),
+            (
+                "payload extra key",
+                format!(r#"{{"type":"token_count","info":{{"last_token_usage":{valid_usage},"model_context_window":128000,"total_token_usage":{valid_usage}}},"rate_limits":null,"extra":true}}"#),
+            ),
+            (
+                "missing info field",
+                format!(r#"{{"type":"token_count","info":{{"last_token_usage":{valid_usage},"model_context_window":128000}},"rate_limits":null}}"#),
+            ),
+            (
+                "usage key drift",
+                r#"{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"cached_input_tokens":1,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21,"unknown_tokens":1},"model_context_window":128000,"total_token_usage":{"input_tokens":7,"cached_input_tokens":1,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21}},"rate_limits":null}"#.to_string(),
+            ),
+            (
+                "negative usage",
+                r#"{"type":"token_count","info":{"last_token_usage":{"input_tokens":-1,"cached_input_tokens":1,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21},"model_context_window":128000,"total_token_usage":{"input_tokens":7,"cached_input_tokens":1,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21}},"rate_limits":null}"#.to_string(),
+            ),
+            (
+                "boolean usage",
+                r#"{"type":"token_count","info":{"last_token_usage":{"input_tokens":true,"cached_input_tokens":1,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21},"model_context_window":128000,"total_token_usage":{"input_tokens":7,"cached_input_tokens":1,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21}},"rate_limits":null}"#.to_string(),
+            ),
+            (
+                "bad context window",
+                format!(r#"{{"type":"token_count","info":{{"last_token_usage":{valid_usage},"model_context_window":-0.5,"total_token_usage":{valid_usage}}},"rate_limits":null}}"#),
+            ),
+            (
+                "bad rate limits",
+                format!(r#"{{"type":"token_count","info":{{"last_token_usage":{valid_usage},"model_context_window":128000,"total_token_usage":{valid_usage}}},"rate_limits":[]}}"#),
+            ),
+            (
+                "rate only missing object",
+                r#"{"type":"token_count","info":null,"rate_limits":null}"#.to_string(),
+            ),
+        ];
+
+        for (case, payload) in cases {
+            let content = format!(
+                "{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-23T00:00:00Z\",\"payload\":{payload}}}\n"
+            );
+            let error = scan_synthetic_jsonl(&content).unwrap_err();
+            assert!(
+                error.to_string().contains("token_count"),
+                "{case}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_codex_metadata_side_effects_require_current_shapes() {
+        let content = concat!(
+            r#"{"type":"session_meta","timestamp":"2026-07-23T00:00:00Z","payload":{"cwd":"/tmp/metadata-contract"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:01Z","payload":{"type":"message","role":"assistant","content":"answer"}}"#,
+            "\n",
+            r#"{"type":"turn_context","timestamp":"2026-07-23T00:00:02Z","payload":{"model":"gpt-metadata"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-23T00:00:03Z","payload":{"type":"message","role":"assistant","content":"authored answer"}}"#,
+            "\n",
+        );
+
+        let convs = scan_synthetic_jsonl(content).unwrap();
+        let conv = &convs[0];
+        assert_eq!(
+            conv.workspace,
+            Some(PathBuf::from("/tmp/metadata-contract"))
+        );
+        assert_eq!(conv.messages[0].author, None);
+        assert_eq!(conv.messages[1].author.as_deref(), Some("gpt-metadata"));
+        assert!(conv.started_at < conv.messages[0].created_at);
+        assert!(conv.ended_at > conv.messages[0].created_at);
+    }
+
+    #[test]
+    fn scan_codex_metadata_records_fail_closed_before_side_effects() {
+        let cases = [
+            (
+                "session missing timestamp",
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/project"}}"#,
+            ),
+            (
+                "session null timestamp",
+                r#"{"type":"session_meta","timestamp":null,"payload":{"cwd":"/tmp/project"}}"#,
+            ),
+            (
+                "session numeric timestamp",
+                r#"{"type":"session_meta","timestamp":7,"payload":{"cwd":"/tmp/project"}}"#,
+            ),
+            (
+                "session missing payload",
+                r#"{"type":"session_meta","timestamp":"2026-07-23T00:00:00Z"}"#,
+            ),
+            (
+                "session null payload",
+                r#"{"type":"session_meta","timestamp":"2026-07-23T00:00:00Z","payload":null}"#,
+            ),
+            (
+                "session string payload",
+                r#"{"type":"session_meta","timestamp":"2026-07-23T00:00:00Z","payload":"bad"}"#,
+            ),
+            (
+                "session array payload",
+                r#"{"type":"session_meta","timestamp":"2026-07-23T00:00:00Z","payload":[]}"#,
+            ),
+            (
+                "session missing cwd",
+                r#"{"type":"session_meta","timestamp":"2026-07-23T00:00:00Z","payload":{}}"#,
+            ),
+            (
+                "session wrong cwd",
+                r#"{"type":"session_meta","timestamp":"2026-07-23T00:00:00Z","payload":{"cwd":7}}"#,
+            ),
+            (
+                "turn missing timestamp",
+                r#"{"type":"turn_context","payload":{"model":"gpt-synthetic"}}"#,
+            ),
+            (
+                "turn null timestamp",
+                r#"{"type":"turn_context","timestamp":null,"payload":{"model":"gpt-synthetic"}}"#,
+            ),
+            (
+                "turn numeric timestamp",
+                r#"{"type":"turn_context","timestamp":7,"payload":{"model":"gpt-synthetic"}}"#,
+            ),
+            (
+                "turn missing payload",
+                r#"{"type":"turn_context","timestamp":"2026-07-23T00:00:00Z"}"#,
+            ),
+            (
+                "turn null payload",
+                r#"{"type":"turn_context","timestamp":"2026-07-23T00:00:00Z","payload":null}"#,
+            ),
+            (
+                "turn string payload",
+                r#"{"type":"turn_context","timestamp":"2026-07-23T00:00:00Z","payload":"bad"}"#,
+            ),
+            (
+                "turn array payload",
+                r#"{"type":"turn_context","timestamp":"2026-07-23T00:00:00Z","payload":[]}"#,
+            ),
+            (
+                "turn missing model",
+                r#"{"type":"turn_context","timestamp":"2026-07-23T00:00:00Z","payload":{}}"#,
+            ),
+            (
+                "turn wrong model",
+                r#"{"type":"turn_context","timestamp":"2026-07-23T00:00:00Z","payload":{"model":7}}"#,
+            ),
+        ];
+
+        for (case, content) in cases {
+            let error = scan_synthetic_jsonl(content).unwrap_err();
+            assert!(
+                error.to_string().contains("session_meta")
+                    || error.to_string().contains("turn_context"),
+                "{case}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_codex_compact_and_noncompact_preserve_same_contract_fields() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let records = vec![
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-23T00:00:00Z",
+                "payload": {
+                    "type": "agent_message",
+                    "content": [
+                        {"type": "text", "text": "visible agent"},
+                        {"type": "encrypted_content", "encrypted_content": "opaque-agent"}
+                    ]
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-23T00:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"true\"}",
+                    "call_id": "compact-call"
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-23T00:00:02Z",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "output": "unpaired compact result"
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-23T00:00:03Z",
+                "payload": {
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-reasoning"
+                }
+            }),
+        ];
+        let small = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(sessions.join("rollout-small.jsonl"), small).unwrap();
+
+        let mut large_records = records.clone();
+        large_records[0].as_object_mut().unwrap().insert(
+            "padding".to_string(),
+            Value::String("x".repeat(32 * 1024 * 1024)),
+        );
+        let large = large_records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(sessions.join("rollout-large.jsonl"), large).unwrap();
+
+        let convs = CodexConnector::new()
+            .scan(&ScanContext::local_default(codex_dir, None))
+            .unwrap();
+        let small = convs
+            .iter()
+            .find(|conv| conv.external_id.as_deref() == Some("rollout-small"))
+            .unwrap();
+        let large = convs
+            .iter()
+            .find(|conv| conv.external_id.as_deref() == Some("rollout-large"))
+            .unwrap();
+
+        let contract_snapshot = |conv: &NormalizedConversation| {
+            conv.messages
+                .iter()
+                .map(|message| {
+                    json!({
+                        "idx": message.idx,
+                        "role": message.role,
+                        "content": message.content,
+                        "raw_role": message.extra.get("raw_role"),
+                        "tool_call_id": message.extra.get("tool_call_id"),
+                        "tool_call_args": message.extra.get("tool_call_args"),
+                        "unpaired": message.extra.get("unpaired"),
+                        "encrypted_content": message.extra.get("encrypted_content"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(contract_snapshot(small), contract_snapshot(large));
+        assert!(
+            large
+                .messages
+                .iter()
+                .all(|message| message.extra.get("payload").is_none())
+        );
+    }
+
+    #[test]
+    fn scan_codex_compact_path_rejects_raw_envelope_raw_role_collision() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let record = json!({
+            "type": "response_item",
+            "timestamp": "2026-07-23T00:00:00Z",
+            "raw_role": "collision",
+            "padding": "x".repeat(32 * 1024 * 1024),
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": "visible"
+            }
+        });
+        fs::write(
+            sessions.join("rollout-compact-collision.jsonl"),
+            record.to_string() + "\n",
+        )
+        .unwrap();
+
+        let error = CodexConnector::new()
+            .scan(&ScanContext::local_default(codex_dir, None))
+            .unwrap_err();
+        assert!(error.to_string().contains("raw_role"));
+    }
+
+    #[test]
+    fn scan_codex_compact_visible_agent_rejects_top_level_encrypted_content_collision() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let collision_value = "must-not-appear-in-errors-compact-agent";
+        let record = json!({
+            "type": "response_item",
+            "timestamp": "2026-07-23T00:00:00Z",
+            "encrypted_content": collision_value,
+            "padding": "x".repeat(32 * 1024 * 1024),
+            "payload": {
+                "type": "agent_message",
+                "content": [{"type": "text", "text": "visible agent"}]
+            }
+        });
+        fs::write(
+            sessions.join("rollout-compact-encrypted-collision.jsonl"),
+            record.to_string() + "\n",
+        )
+        .unwrap();
+
+        let error = CodexConnector::new()
+            .scan(&ScanContext::local_default(codex_dir, None))
+            .unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"), "{error:#}");
+        assert!(!error.to_string().contains(collision_value), "{error:#}");
+    }
+
+    #[test]
+    fn scan_codex_compact_plain_message_rejects_top_level_encrypted_content_collision() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let collision_value = "must-not-appear-in-errors-compact-plain-message";
+        let record = json!({
+            "type": "response_item",
+            "timestamp": "2026-07-23T00:00:00Z",
+            "encrypted_content": collision_value,
+            "padding": "x".repeat(32 * 1024 * 1024),
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": "visible user"
+            }
+        });
+        fs::write(
+            sessions.join("rollout-compact-plain-encrypted-collision.jsonl"),
+            record.to_string() + "\n",
+        )
+        .unwrap();
+
+        let error = CodexConnector::new()
+            .scan(&ScanContext::local_default(codex_dir, None))
+            .unwrap_err();
+        assert!(error.to_string().contains("encrypted_content"), "{error:#}");
+        assert!(!error.to_string().contains(collision_value), "{error:#}");
+    }
+
+    #[test]
+    fn scan_codex_legacy_json_matches_reviewed_literal_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let legacy = json!({
+            "session": {"cwd": "/tmp/legacy-contract"},
+            "items": [
+                {"content": "legacy default"},
+                {"role": "assistant", "content": "legacy assistant"}
+            ]
+        });
+        fs::write(
+            sessions.join("rollout-legacy-snapshot.json"),
+            legacy.to_string(),
+        )
+        .unwrap();
+
+        let convs = CodexConnector::new()
+            .scan(&ScanContext::local_default(codex_dir, None))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&convs[0].messages).unwrap(),
+            json!([
+                {
+                    "idx": 0,
+                    "role": "agent",
+                    "author": null,
+                    "created_at": null,
+                    "content": "legacy default",
+                    "extra": {"content": "legacy default"},
+                    "snippets": []
+                },
+                {
+                    "idx": 1,
+                    "role": "assistant",
+                    "author": null,
+                    "created_at": null,
+                    "content": "legacy assistant",
+                    "extra": {"role": "assistant", "content": "legacy assistant"},
+                    "snippets": []
+                }
+            ])
+        );
     }
 
     #[test]
@@ -2426,11 +4032,11 @@ not valid json at all
         let sessions = codex_dir.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
 
-        // response_item and event_msg without payload field
+        // response_item and event_msg without payload stay ignorable. Strict
+        // metadata records are covered separately and fail closed.
         let content = concat!(
             "{\"type\":\"response_item\",\"timestamp\":\"2025-12-01T10:00:00Z\"}\n",
             "{\"type\":\"event_msg\",\"timestamp\":\"2025-12-01T10:00:01Z\"}\n",
-            "{\"type\":\"session_meta\",\"timestamp\":\"2025-12-01T10:00:02Z\"}\n",
             "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":\"Has payload\"}}\n",
         );
         fs::write(sessions.join("rollout-nopayload.jsonl"), content).unwrap();
@@ -2498,7 +4104,7 @@ not valid json at all
         // Test various workspace path formats in session_meta
         let content = concat!(
             // Path with spaces
-            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/home/user/my project/src\"}}\n",
+            "{\"type\":\"session_meta\",\"timestamp\":\"2025-12-01T10:00:00Z\",\"payload\":{\"cwd\":\"/home/user/my project/src\"}}\n",
             "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":\"Spaces path\"}}\n",
         );
         fs::write(sessions.join("rollout-spaces.jsonl"), content).unwrap();
@@ -2515,7 +4121,7 @@ not valid json at all
 
         // Unicode workspace path
         let content2 = concat!(
-            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/home/\u{00FC}ser/projekt\"}}\n",
+            "{\"type\":\"session_meta\",\"timestamp\":\"2025-12-01T10:00:00Z\",\"payload\":{\"cwd\":\"/home/\u{00FC}ser/projekt\"}}\n",
             "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":\"Unicode path\"}}\n",
         );
         fs::write(sessions.join("rollout-unicode.jsonl"), content2).unwrap();
@@ -2558,13 +4164,19 @@ not valid json at all
         // user_message + tool_call events should produce messages
         assert_eq!(convs[0].messages.len(), 2);
 
-        // tool_call event should produce an assistant message with invocation
+        // tool_call event should produce its own `tool_call` message (not
+        // inlined into `assistant`), with invocation args intact.
         let tool_msg = &convs[0].messages[0];
-        assert_eq!(tool_msg.role, "assistant");
+        assert_eq!(tool_msg.role, "tool_call");
         assert_eq!(tool_msg.invocations.len(), 1);
         assert_eq!(tool_msg.invocations[0].kind, "tool");
         assert_eq!(tool_msg.invocations[0].name, "bash");
         assert!(tool_msg.invocations[0].arguments.is_some());
+        assert!(
+            tool_msg.content.contains("bash"),
+            "content should render the tool name + args, not a bare marker: {}",
+            tool_msg.content
+        );
 
         // user_message event should still produce a user message
         let user_msg = &convs[0].messages[1];

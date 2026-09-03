@@ -686,6 +686,20 @@ impl Connector for PiAgentConnector {
                     continue;
                 }
 
+                // Prefer the transcript's own session id (parsed from the
+                // `session` header above) over the path-derived fallback.
+                // external_id is one third of the conversation identity key
+                // (UNIQUE(source_id, agent_id, external_id)) and the embedded
+                // id is stable across file moves / store relocation, unlike
+                // the path-derived fallback. Cherry-picked in spirit from
+                // upstream 718a86c73beb92649d5f5fdeb667644bdb8c1abe (cass
+                // gh#411), adapted to this fork's inline pi_agent.rs parsing
+                // (upstream's shared omp.rs post-pass doesn't exist here).
+                let external_id = session_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .or(external_id);
+
                 // Extract title from first user message
                 let title = messages
                     .iter()
@@ -1285,6 +1299,47 @@ mod tests {
         assert!(convs[0].external_id.is_some());
         let ext_id = convs[0].external_id.as_ref().unwrap();
         assert!(ext_id.contains("Users-foo-project") || ext_id.contains("uuid1"));
+    }
+
+    #[test]
+    fn scan_prefers_embedded_session_id_as_external_id() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_pi_agent_storage(&dir);
+
+        let lines = [
+            r#"{"type":"session","id":"embedded-session-id-xyz","timestamp":"2025-12-01T10:00:00Z"}"#,
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Test"}}"#,
+        ];
+        write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
+
+        let connector = PiAgentConnector::new();
+        let ctx = ScanContext::local_default(storage, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(
+            convs[0].external_id.as_deref(),
+            Some("embedded-session-id-xyz")
+        );
+    }
+
+    #[test]
+    fn scan_falls_back_to_path_derived_external_id_without_session_header() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_pi_agent_storage(&dir);
+
+        let lines = [
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Test"}}"#,
+        ];
+        write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
+
+        let connector = PiAgentConnector::new();
+        let ctx = ScanContext::local_default(storage, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert!(convs[0]
+            .external_id
+            .as_deref()
+            .is_some_and(|id| id.contains("uuid1")));
     }
 
     // =====================================================
