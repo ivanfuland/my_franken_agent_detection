@@ -1336,10 +1336,12 @@ mod tests {
         let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert!(convs[0]
-            .external_id
-            .as_deref()
-            .is_some_and(|id| id.contains("uuid1")));
+        assert!(
+            convs[0]
+                .external_id
+                .as_deref()
+                .is_some_and(|id| id.contains("uuid1"))
+        );
     }
 
     // =====================================================
