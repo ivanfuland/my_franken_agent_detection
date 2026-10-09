@@ -838,6 +838,10 @@ impl OpenCodeConnector {
         self.scan_with_locations(ctx, Some(defaults))
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "The shared scanner retains the stateless unit connector's instance API"
+    )]
     fn scan_with_locations(
         &self,
         ctx: &ScanContext,
