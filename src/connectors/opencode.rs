@@ -44,6 +44,16 @@ use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
 pub struct OpenCodeConnector;
 
+/// Caller-supplied replacements for OpenCode's environment-derived locations.
+///
+/// The default value supplies no ambient locations. Explicit locations in the
+/// scan context keep their existing priority and behavior.
+#[derive(Debug, Clone, Default)]
+pub struct OpenCodeDefaultLocations {
+    pub sqlite_databases: Vec<PathBuf>,
+    pub json_storage_root: Option<PathBuf>,
+}
+
 impl Default for OpenCodeConnector {
     fn default() -> Self {
         Self::new()
@@ -805,6 +815,34 @@ impl Connector for OpenCodeConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        self.scan_with_locations(ctx, None)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
+    }
+}
+
+impl OpenCodeConnector {
+    /// Scan with explicit replacements for environment-derived defaults.
+    ///
+    /// Empty SQLite locations and a missing JSON root do not fall back to the
+    /// environment. Context data and scan roots retain their existing behavior.
+    /// JSON defaults are consulted only when the context uses default detection
+    /// and its data directory is not already an OpenCode storage directory.
+    pub fn scan_with_default_locations(
+        &self,
+        ctx: &ScanContext,
+        defaults: &OpenCodeDefaultLocations,
+    ) -> Result<Vec<NormalizedConversation>> {
+        self.scan_with_locations(ctx, Some(defaults))
+    }
+
+    fn scan_with_locations(
+        &self,
+        ctx: &ScanContext,
+        defaults: Option<&OpenCodeDefaultLocations>,
+    ) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
         let mut scanned_dbs: HashSet<PathBuf> = HashSet::new();
 
@@ -837,7 +875,11 @@ impl Connector for OpenCodeConnector {
             }
         }
 
-        db_candidates.extend(Self::sqlite_db_candidates());
+        if let Some(defaults) = defaults {
+            db_candidates.extend(defaults.sqlite_databases.iter().cloned());
+        } else {
+            db_candidates.extend(Self::sqlite_db_candidates());
+        }
 
         // Deduplicate while preserving priority order.
         {
@@ -879,7 +921,10 @@ impl Connector for OpenCodeConnector {
         if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
                 storage_roots.push(ctx.data_dir.clone());
-            } else if let Some(root) = Self::storage_root() {
+            } else if let Some(root) = match defaults {
+                Some(defaults) => defaults.json_storage_root.clone(),
+                None => Self::storage_root(),
+            } {
                 storage_roots.push(root);
             }
         } else {
@@ -1008,10 +1053,6 @@ impl Connector for OpenCodeConnector {
         }
 
         Ok(convs)
-    }
-
-    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
     }
 }
 
@@ -1732,6 +1773,184 @@ mod tests {
         let part_dir = storage.join("part").join(message_id);
         fs::create_dir_all(&part_dir).unwrap();
         fs::write(part_dir.join(format!("{part_id}.json")), part.to_string()).unwrap();
+    }
+
+    // Synthetic schema follows CASS's independent connector_opencode fixture.
+    // These tests exercise location selection, not field mapping changes.
+    fn write_location_json_fixture(storage: &Path, session_id: &str) {
+        for component in ["session", "message", "part"] {
+            fs::create_dir_all(storage.join(component)).unwrap();
+        }
+        let message_id = format!("{session_id}-message");
+        write_session(
+            storage,
+            "synthetic-project",
+            &json!({"id":session_id,"projectID":"synthetic-project","title":"Synthetic location fixture","directory":"synthetic-workspace","time":{"created":1700000000000_i64,"updated":1700000000001_i64}}),
+        );
+        write_message(
+            storage,
+            session_id,
+            &json!({"id":message_id,"sessionID":session_id,"role":"user","time":{"created":1700000000000_i64}}),
+        );
+        write_part(
+            storage,
+            &message_id,
+            &json!({"id":"synthetic-part","messageID":message_id,"type":"text","text":"Synthetic default location message"}),
+        );
+    }
+
+    fn write_location_sqlite_fixture(root: &Path, session_id: &str) -> PathBuf {
+        let path = create_test_sqlite_db(root);
+        let connection = open_test_connection(&path);
+        let message_id = format!("{session_id}-message");
+        connection.execute_compat(
+            "INSERT INTO session (id,project_id,title,directory,time_created,time_updated) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![session_id,"synthetic-project","Synthetic location fixture","synthetic-workspace","1700000000000","1700000000001"],
+        ).unwrap();
+        connection.execute_compat(
+            "INSERT INTO message (id,session_id,data,time_created,time_updated) VALUES (?1,?2,?3,?4,?5)",
+            params![message_id.as_str(),session_id,r#"{"role":"user","time":{"created":1700000000000}}"#,"1700000000000","1700000000001"],
+        ).unwrap();
+        connection
+            .execute_compat(
+                "INSERT INTO part (id,message_id,session_id,data) VALUES (?1,?2,?3,?4)",
+                params![
+                    "synthetic-part",
+                    message_id.as_str(),
+                    session_id,
+                    r#"{"type":"text","text":"Synthetic default location message"}"#
+                ],
+            )
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn supplied_empty_defaults_keep_context_json_without_ambient_fallback() {
+        let root = TempDir::new().unwrap();
+        let storage = root.path().join("storage");
+        write_location_json_fixture(&storage, "synthetic-context-json");
+        let connector = OpenCodeConnector::new();
+        let defaults = OpenCodeDefaultLocations::default();
+        assert!(defaults.sqlite_databases.is_empty());
+        assert!(defaults.json_storage_root.is_none());
+        let conversations = connector
+            .scan_with_default_locations(&ScanContext::local_default(storage, None), &defaults)
+            .unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(
+            conversations[0].external_id.as_deref(),
+            Some("synthetic-context-json")
+        );
+    }
+
+    #[test]
+    fn supplied_json_default_retains_context_storage_priority() {
+        let root = TempDir::new().unwrap();
+        let explicit = root.path().join("explicit");
+        let supplied = root.path().join("supplied");
+        write_location_json_fixture(&explicit, "synthetic-context-json");
+        write_location_json_fixture(&supplied, "synthetic-supplied-json");
+        let defaults = OpenCodeDefaultLocations {
+            sqlite_databases: Vec::new(),
+            json_storage_root: Some(supplied),
+        };
+        let connector = OpenCodeConnector::new();
+        let fallback = connector
+            .scan_with_default_locations(
+                &ScanContext::local_default(root.path().join("missing"), None),
+                &defaults,
+            )
+            .unwrap();
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(
+            fallback[0].external_id.as_deref(),
+            Some("synthetic-supplied-json")
+        );
+        let explicit = connector
+            .scan_with_default_locations(&ScanContext::local_default(explicit, None), &defaults)
+            .unwrap();
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(
+            explicit[0].external_id.as_deref(),
+            Some("synthetic-context-json")
+        );
+    }
+
+    #[test]
+    fn supplied_sqlite_locations_keep_context_priority_and_path_deduplication() {
+        let root = TempDir::new().unwrap();
+        let first = root.path().join("context");
+        let second = root.path().join("supplied");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let context_db = write_location_sqlite_fixture(&first, "synthetic-context-db");
+        let supplied_db = write_location_sqlite_fixture(&second, "synthetic-supplied-db");
+        let defaults = OpenCodeDefaultLocations {
+            sqlite_databases: vec![context_db.clone(), supplied_db.clone(), supplied_db],
+            json_storage_root: None,
+        };
+        let conversations = OpenCodeConnector::new()
+            .scan_with_default_locations(&ScanContext::local_default(context_db, None), &defaults)
+            .unwrap();
+        assert_eq!(conversations.len(), 2);
+        assert_eq!(
+            conversations[0].external_id.as_deref(),
+            Some("synthetic-context-db")
+        );
+        assert_eq!(
+            conversations[1].external_id.as_deref(),
+            Some("synthetic-supplied-db")
+        );
+    }
+
+    #[test]
+    fn supplied_empty_defaults_keep_explicit_roots_and_json_deduplication() {
+        let root = TempDir::new().unwrap();
+        let storage = root.path().join("storage");
+        write_location_json_fixture(&storage, "synthetic-explicit-root");
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone()), ScanRoot::local(storage)],
+            None,
+        );
+        let conversations = OpenCodeConnector::new()
+            .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+            .unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(
+            conversations[0].external_id.as_deref(),
+            Some("synthetic-explicit-root")
+        );
+    }
+
+    #[test]
+    fn supplied_locations_preserve_since_timestamp_filters() {
+        let root = TempDir::new().unwrap();
+        let storage = root.path().join("storage");
+        write_location_json_fixture(&storage, "synthetic-old-json");
+        let database = root.path().join("database");
+        fs::create_dir(&database).unwrap();
+        let db = write_location_sqlite_fixture(&database, "synthetic-old-db");
+        let defaults = OpenCodeDefaultLocations {
+            sqlite_databases: vec![db],
+            json_storage_root: Some(storage),
+        };
+        let connector = OpenCodeConnector::new();
+        let old = connector
+            .scan_with_default_locations(
+                &ScanContext::local_default(PathBuf::new(), None),
+                &defaults,
+            )
+            .unwrap();
+        assert_eq!(old.len(), 2);
+        let filtered = connector
+            .scan_with_default_locations(
+                &ScanContext::local_default(PathBuf::new(), Some(i64::MAX)),
+                &defaults,
+            )
+            .unwrap();
+        assert!(filtered.is_empty());
     }
 
     // =====================================================

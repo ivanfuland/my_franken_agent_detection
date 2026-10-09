@@ -44,7 +44,7 @@ pub use connectors::goose::GooseConnector;
 #[cfg(feature = "hermes")]
 pub use connectors::hermes::HermesConnector;
 #[cfg(feature = "opencode")]
-pub use connectors::opencode::OpenCodeConnector;
+pub use connectors::opencode::{OpenCodeConnector, OpenCodeDefaultLocations};
 #[cfg(feature = "connectors")]
 pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenDataSource};
 #[cfg(feature = "connectors")]
