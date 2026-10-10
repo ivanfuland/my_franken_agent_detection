@@ -1,0 +1,6 @@
+{
+  "source": "{\"a\":1}\n \t\r\n{\"a\":2}\r\nnull",
+  "locators": [[1,0,7,1],[3,12,19,2],[4,21,25,0]],
+  "blank_lines": 1,
+  "blank_bytes": 2
+}

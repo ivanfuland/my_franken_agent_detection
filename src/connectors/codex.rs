@@ -1170,7 +1170,702 @@ fn scan_codex_with_callback(
     Ok(())
 }
 
+fn codex_source_extra_reason(value: &Value) -> &'static str {
+    if value.get("encrypted_content").is_some() {
+        "projection_encrypted_content_invalid"
+    } else {
+        "projection_reserved_raw_role"
+    }
+}
+/// Mutable projection state shared by the per-arm Codex handlers.
+struct CodexProjection {
+    compact_message_extra: bool,
+    messages: Vec<NormalizedMessage>,
+    claims: Vec<crate::SourceMappingClaim>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    session_cwd: Option<PathBuf>,
+    current_model: Option<String>,
+}
+
+struct CodexSourceProjector {
+    source_path: PathBuf,
+    external_id: Option<String>,
+    format: crate::SourceFormat,
+    compact_message_extra: bool,
+    messages: Vec<NormalizedMessage>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    session_cwd: Option<PathBuf>,
+    current_model: Option<String>,
+}
+impl crate::source_mapping::SourceProjector for CodexSourceProjector {
+    fn project(
+        &mut self,
+        val: &Value,
+        locator: &crate::SourceRecordLocator,
+    ) -> Result<Vec<crate::SourceMappingClaim>, &'static str> {
+        let mut pending = CodexProjection {
+            compact_message_extra: self.compact_message_extra,
+            claims: Vec::new(),
+            messages: std::mem::take(&mut self.messages),
+            started_at: std::mem::take(&mut self.started_at),
+            ended_at: std::mem::take(&mut self.ended_at),
+            session_cwd: std::mem::take(&mut self.session_cwd),
+            current_model: std::mem::take(&mut self.current_model),
+        };
+        let projected = if self.format == crate::SourceFormat::Jsonl {
+            project_codex_jsonl(val, locator, &mut pending)
+        } else {
+            project_codex_document(val, locator, &mut pending)
+        };
+        self.messages = pending.messages;
+        self.started_at = pending.started_at;
+        self.ended_at = pending.ended_at;
+        self.session_cwd = pending.session_cwd;
+        self.current_model = pending.current_model;
+        projected.map(|()| pending.claims)
+    }
+    fn finish(self) -> Option<NormalizedConversation> {
+        let Self {
+            source_path,
+            external_id,
+            format,
+            messages,
+            started_at,
+            ended_at,
+            session_cwd,
+            ..
+        } = self;
+        if messages.is_empty() {
+            return None;
+        }
+        let title = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| {
+                m.content
+                    .lines()
+                    .next()
+                    .unwrap_or(&m.content)
+                    .chars()
+                    .take(100)
+                    .collect::<String>()
+            })
+            .or_else(|| {
+                messages
+                    .first()
+                    .and_then(|m| m.content.lines().next())
+                    .map(|s| s.chars().take(100).collect())
+            });
+
+        Some(NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id,
+            title,
+            workspace: session_cwd,
+            source_path,
+            started_at,
+            ended_at,
+            metadata: serde_json::json!({"source": if format == crate::SourceFormat::JsonDocument { "rollout_json" } else { "rollout" }}),
+            messages,
+        })
+    }
+}
+
+/// Dispatch one JSONL envelope. The record already passed syntax parsing.
+fn project_codex_jsonl(
+    val: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+) -> Result<(), &'static str> {
+    let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let created = val.get("timestamp").and_then(parse_timestamp);
+
+    match entry_type {
+        "session_meta" => {
+            let (cwd, metadata_created) = metadata_field_and_timestamp(val, "session_meta", "cwd")
+                .map_err(|_| "projection_metadata_shape")?;
+            pending.session_cwd = Some(PathBuf::from(cwd));
+            update_time_bounds(
+                &mut pending.started_at,
+                &mut pending.ended_at,
+                metadata_created,
+            );
+        }
+        "turn_context" => {
+            let (model, metadata_created) =
+                metadata_field_and_timestamp(val, "turn_context", "model")
+                    .map_err(|_| "projection_metadata_shape")?;
+            pending.current_model = Some(model.to_string());
+            update_time_bounds(
+                &mut pending.started_at,
+                &mut pending.ended_at,
+                metadata_created,
+            );
+        }
+        "response_item" => project_codex_response_item(val, locator, pending, created)?,
+        "event_msg" => project_codex_event_msg(val, locator, pending, created)?,
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// Dispatch one `response_item` payload by its declared type.
+fn project_codex_response_item(
+    val: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+) -> Result<(), &'static str> {
+    let Some(payload) = val.get("payload") else {
+        return Ok(());
+    };
+    let payload_type = match payload.get("type") {
+        None => None,
+        Some(Value::String(payload_type)) => Some(payload_type.as_str()),
+        Some(_) => return Err("projection_payload_type"),
+    };
+    match payload_type {
+        Some("message") | None => {
+            project_codex_prose_item(val, payload, locator, pending, created)?;
+        }
+        Some("agent_message") => {
+            project_codex_agent_message_item(val, payload, locator, pending, created)?;
+        }
+        Some("reasoning") => {
+            project_codex_reasoning_item(val, payload, locator, pending, created)?;
+        }
+        Some(raw_role @ ("function_call" | "custom_tool_call")) => {
+            project_codex_tool_call_item(val, payload, locator, pending, created, raw_role)?;
+        }
+        Some(raw_role @ ("function_call_output" | "custom_tool_call_output")) => {
+            project_codex_tool_output_item(val, payload, locator, pending, created, raw_role)?;
+        }
+        Some(_) => {}
+    }
+
+    Ok(())
+}
+
+/// `response_item` of type `message`: one prose message.
+fn project_codex_prose_item(
+    val: &Value,
+    payload: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+) -> Result<(), &'static str> {
+    let Some(role @ ("user" | "assistant")) = payload.get("role").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let content = payload
+        .get("content")
+        .map(flatten_content)
+        .unwrap_or_default();
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    let extra = CodexConnector::normalized_message_extra(val, pending.compact_message_extra, role)
+        .map_err(|_| codex_source_extra_reason(val))?;
+    let invocations = payload
+        .get("content")
+        .map_or_else(Vec::new, extract_invocations_from_content_blocks);
+    update_time_bounds(&mut pending.started_at, &mut pending.ended_at, created);
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        locator,
+        vec!["/payload".into()],
+        "prose",
+        NormalizedMessage {
+            idx: 0,
+            role: role.to_string(),
+            author: (role == "assistant")
+                .then(|| pending.current_model.clone())
+                .flatten(),
+            created_at: created,
+            content,
+            extra,
+            invocations,
+            snippets: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+/// `response_item` of type `agent_message`.
+fn project_codex_agent_message_item(
+    val: &Value,
+    payload: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+) -> Result<(), &'static str> {
+    let (content, encrypted_content) =
+        parse_agent_message_content(payload).map_err(|_| "projection_agent_message_shape")?;
+    if content.trim().is_empty() {
+        if let Some(encrypted_content) = encrypted_content.as_ref() {
+            let mut validation_extra = if pending.compact_message_extra {
+                CodexConnector::compact_message_extra(val)
+            } else {
+                val.clone()
+            };
+            add_encrypted_content(val, &mut validation_extra, encrypted_content)
+                .map_err(|_| "projection_encrypted_content_invalid")?;
+        }
+        return Ok(());
+    }
+    let mut extra = CodexConnector::normalized_message_extra(
+        val,
+        pending.compact_message_extra,
+        "agent_message",
+    )
+    .map_err(|_| codex_source_extra_reason(val))?;
+    if let Some(encrypted_content) = encrypted_content.as_ref() {
+        add_encrypted_content(val, &mut extra, encrypted_content)
+            .map_err(|_| "projection_encrypted_content_invalid")?;
+    }
+    update_time_bounds(&mut pending.started_at, &mut pending.ended_at, created);
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        locator,
+        vec!["/payload".into()],
+        "prose",
+        NormalizedMessage {
+            idx: 0,
+            role: "user".to_string(),
+            author: None,
+            created_at: created,
+            content,
+            extra,
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+/// `response_item` of type `reasoning`.
+fn project_codex_reasoning_item(
+    val: &Value,
+    payload: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+) -> Result<(), &'static str> {
+    let content = reasoning_summary_text(payload).map_err(|_| "projection_reasoning_shape")?;
+    let encrypted_content = payload.get("encrypted_content");
+    if content.trim().is_empty() && encrypted_content.is_none() {
+        return Ok(());
+    }
+    let mut extra =
+        CodexConnector::normalized_message_extra(val, pending.compact_message_extra, "reasoning")
+            .map_err(|_| codex_source_extra_reason(val))?;
+    if let Some(encrypted_content) = encrypted_content {
+        add_encrypted_content(val, &mut extra, encrypted_content)
+            .map_err(|_| "projection_encrypted_content_invalid")?;
+    }
+    update_time_bounds(&mut pending.started_at, &mut pending.ended_at, created);
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        locator,
+        vec!["/payload".into()],
+        "reasoning",
+        NormalizedMessage {
+            idx: 0,
+            role: "reasoning".to_string(),
+            author: pending.current_model.clone(),
+            created_at: created,
+            content,
+            extra,
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+/// `response_item` of a call type.
+fn project_codex_tool_call_item(
+    val: &Value,
+    payload: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+    raw_role: &str,
+) -> Result<(), &'static str> {
+    let tool_name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let arguments = parse_tool_call_arguments(payload);
+    let call_id = payload
+        .get("call_id")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let content = render_tool_call_content(&tool_name, arguments.as_ref());
+    let mut extra =
+        CodexConnector::normalized_message_extra(val, pending.compact_message_extra, raw_role)
+            .map_err(|_| codex_source_extra_reason(val))?;
+    let extra_object = extra.as_object_mut().ok_or("projection_payload_type")?;
+    if let Some(id) = call_id.as_ref() {
+        extra_object.insert("tool_call_id".to_string(), Value::String(id.clone()));
+    }
+    extra_object.insert(
+        "tool_call_args".to_string(),
+        arguments.clone().unwrap_or(Value::Null),
+    );
+    update_time_bounds(&mut pending.started_at, &mut pending.ended_at, created);
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        locator,
+        vec!["/payload".into()],
+        "tool_call",
+        NormalizedMessage {
+            idx: 0,
+            role: "tool_call".to_string(),
+            author: pending.current_model.clone(),
+            created_at: created,
+            content,
+            extra,
+            invocations: vec![NormalizedInvocation {
+                kind: "tool".to_string(),
+                name: tool_name,
+                raw_name: None,
+                call_id,
+                arguments,
+            }],
+            snippets: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+/// `response_item` of an output type.
+fn project_codex_tool_output_item(
+    val: &Value,
+    payload: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+    raw_role: &str,
+) -> Result<(), &'static str> {
+    let content = tool_output_text(payload);
+    let call_id = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let mut extra =
+        CodexConnector::normalized_message_extra(val, pending.compact_message_extra, raw_role)
+            .map_err(|_| codex_source_extra_reason(val))?;
+    set_tool_result_pairing(&mut extra, call_id.as_deref())
+        .map_err(|_| "projection_payload_type")?;
+    update_time_bounds(&mut pending.started_at, &mut pending.ended_at, created);
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        locator,
+        vec!["/payload".into()],
+        "tool_result",
+        NormalizedMessage {
+            idx: 0,
+            role: "tool_result".to_string(),
+            author: None,
+            created_at: created,
+            content,
+            extra,
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Dispatch one `event_msg` payload.
+fn project_codex_event_msg(
+    val: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+) -> Result<(), &'static str> {
+    let Some(payload) = val.get("payload") else {
+        return Ok(());
+    };
+    let event_type = payload.get("type").and_then(Value::as_str);
+    // Event-layer agent pending.messages duplicate the visible
+    // response item and are structural noise.
+    if event_type == Some("agent_message") {
+        return Ok(());
+    }
+    match event_type {
+        Some("user_message") => {
+            project_codex_user_message_item(val, payload, locator, pending, created)?;
+        }
+        Some("agent_reasoning") => {
+            project_codex_agent_reasoning_item(val, payload, locator, pending, created)?;
+        }
+        Some("tool_call") => {
+            project_codex_event_tool_item(val, payload, locator, pending, created)?;
+        }
+        Some("token_count") => project_codex_token_count_item(payload, pending)?,
+        Some(_) | None => {}
+    }
+
+    Ok(())
+}
+
+/// Event-layer `user_message`.
+fn project_codex_user_message_item(
+    val: &Value,
+    payload: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+) -> Result<(), &'static str> {
+    let text = payload.get("message").and_then(Value::as_str).unwrap_or("");
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let extra = CodexConnector::normalized_message_extra(
+        val,
+        pending.compact_message_extra,
+        "user_message",
+    )
+    .map_err(|_| codex_source_extra_reason(val))?;
+    update_time_bounds(&mut pending.started_at, &mut pending.ended_at, created);
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        locator,
+        vec!["/payload".into()],
+        "prose",
+        NormalizedMessage {
+            idx: 0,
+            role: "user".to_string(),
+            author: None,
+            created_at: created,
+            content: text.to_string(),
+            extra,
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Event-layer `agent_reasoning`.
+fn project_codex_agent_reasoning_item(
+    val: &Value,
+    payload: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+) -> Result<(), &'static str> {
+    let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let extra = CodexConnector::normalized_message_extra(
+        val,
+        pending.compact_message_extra,
+        "agent_reasoning",
+    )
+    .map_err(|_| codex_source_extra_reason(val))?;
+    update_time_bounds(&mut pending.started_at, &mut pending.ended_at, created);
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        locator,
+        vec!["/payload".into()],
+        "reasoning",
+        NormalizedMessage {
+            idx: 0,
+            role: "reasoning".to_string(),
+            author: pending.current_model.clone(),
+            created_at: created,
+            content: text.to_string(),
+            extra,
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Event-layer `tool_call`, kept as its own push branch.
+fn project_codex_event_tool_item(
+    val: &Value,
+    payload: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+    created: Option<i64>,
+) -> Result<(), &'static str> {
+    let tool_name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let arguments = payload
+        .get("input")
+        .or_else(|| payload.get("arguments"))
+        .cloned();
+    let call_id = payload
+        .get("call_id")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let content = render_tool_call_content(&tool_name, arguments.as_ref());
+    let mut extra =
+        CodexConnector::normalized_message_extra(val, pending.compact_message_extra, "tool_call")
+            .map_err(|_| codex_source_extra_reason(val))?;
+    let extra_object = extra.as_object_mut().ok_or("projection_payload_type")?;
+    if let Some(id) = call_id.as_ref() {
+        extra_object.insert("tool_call_id".to_string(), Value::String(id.clone()));
+    }
+    extra_object.insert(
+        "tool_call_args".to_string(),
+        arguments.clone().unwrap_or(Value::Null),
+    );
+    update_time_bounds(&mut pending.started_at, &mut pending.ended_at, created);
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        locator,
+        vec!["/payload".into()],
+        "tool_call",
+        NormalizedMessage {
+            idx: 0,
+            role: "tool_call".to_string(),
+            author: pending.current_model.clone(),
+            created_at: created,
+            content,
+            extra,
+            invocations: vec![NormalizedInvocation {
+                kind: "tool".to_string(),
+                name: tool_name,
+                raw_name: None,
+                call_id,
+                arguments,
+            }],
+            snippets: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Event-layer `token_count`: an independent snapshot, never a message.
+fn project_codex_token_count_item(
+    payload: &Value,
+    pending: &mut CodexProjection,
+) -> Result<(), &'static str> {
+    if let Some(token_usage) = CodexConnector::token_usage_from_payload(payload)
+        .map_err(|_| "projection_token_count_shape")?
+    {
+        if pending
+            .messages
+            .iter()
+            .any(CodexConnector::is_token_usage_target_message)
+        {
+            CodexConnector::attach_token_usage_to_latest_assistant(
+                &mut pending.messages,
+                token_usage,
+                Path::new(""),
+                0,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whole-document `items` array projection.
+fn project_codex_document(
+    val: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut CodexProjection,
+) -> Result<(), &'static str> {
+    pending.session_cwd = val
+        .get("session")
+        .and_then(|s| s.get("cwd"))
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+
+    if let Some(items) = val.get("items").and_then(|v| v.as_array()) {
+        for (source_index, item) in items.iter().enumerate() {
+            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("agent");
+            let content_str = item.get("content").map(flatten_content).unwrap_or_default();
+
+            if content_str.trim().is_empty() {
+                continue;
+            }
+
+            let created = item.get("timestamp").and_then(parse_timestamp);
+            update_time_bounds(&mut pending.started_at, &mut pending.ended_at, created);
+
+            crate::source_mapping::push_message(
+                &mut pending.messages,
+                &mut pending.claims,
+                locator,
+                vec![format!("/items/{source_index}")],
+                "prose",
+                NormalizedMessage {
+                    idx: 0,
+                    role: role.to_string(),
+                    author: None,
+                    created_at: created,
+                    content: content_str,
+                    extra: if pending.compact_message_extra {
+                        CodexConnector::compact_message_extra(item)
+                    } else {
+                        item.clone()
+                    },
+                    invocations: item
+                        .get("content")
+                        .map_or_else(Vec::new, extract_invocations_from_content_blocks),
+                    snippets: Vec::new(),
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl Connector for CodexConnector {
+    fn scan_source_aware(
+        &self,
+        sealed: &crate::SealedInputContext,
+        sink: &mut dyn crate::SourceMappingSink,
+    ) -> Result<crate::SourceInputFinish, crate::SourceReadFailure> {
+        if sealed.discovery.connector != "codex" {
+            return Err(crate::SourceReadFailure::before_read(
+                sealed,
+                crate::SourceReadFailureKind::InvalidContext,
+            ));
+        }
+        let external_id = Path::new(&sealed.discovery.relative_locator)
+            .with_extension("")
+            .to_str()
+            .map(String::from);
+        let projector = CodexSourceProjector {
+            source_path: sealed.discovery.source_path.clone(),
+            external_id,
+            format: sealed.format,
+            compact_message_extra: Self::should_compact_large_message_extra(Some(sealed.byte_len)),
+            messages: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            session_cwd: None,
+            current_model: None,
+        };
+        crate::source_mapping::scan_projected(sealed, sink, projector)
+    }
+
     fn detect(&self) -> DetectionResult {
         franken_detection_for_connector("codex").unwrap_or_else(DetectionResult::not_found)
     }

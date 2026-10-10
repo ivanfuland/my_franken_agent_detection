@@ -343,17 +343,24 @@ pub(crate) enum TypedBlock {
 /// causing a panic.
 #[must_use]
 pub(crate) fn split_content_blocks(v: &serde_json::Value) -> Vec<TypedBlock> {
+    split_content_blocks_indexed(v)
+        .into_iter()
+        .map(|(_, block)| block)
+        .collect()
+}
+
+pub(crate) fn split_content_blocks_indexed(v: &serde_json::Value) -> Vec<(usize, TypedBlock)> {
     let Some(arr) = v.as_array() else {
         return Vec::new();
     };
 
     let mut blocks = Vec::new();
-    for item in arr {
+    for (source_index, item) in arr.iter().enumerate() {
         let item_type = item.get("type").and_then(|t| t.as_str());
         match item_type {
             Some("text") | Some("input_text") | Some("output_text") => {
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    blocks.push(TypedBlock::Text(text.to_string()));
+                    blocks.push((source_index, TypedBlock::Text(text.to_string())));
                 }
             }
             Some("tool_use") => {
@@ -364,21 +371,27 @@ pub(crate) fn split_content_blocks(v: &serde_json::Value) -> Vec<TypedBlock> {
                     .get("id")
                     .and_then(|i| i.as_str())
                     .map(std::string::ToString::to_string);
-                blocks.push(TypedBlock::ToolCall {
-                    name: name.to_string(),
-                    input: item.get("input").cloned(),
-                    id,
-                });
+                blocks.push((
+                    source_index,
+                    TypedBlock::ToolCall {
+                        name: name.to_string(),
+                        input: item.get("input").cloned(),
+                        id,
+                    },
+                ));
             }
             Some("tool_result") => {
                 let tool_use_id = item
                     .get("tool_use_id")
                     .and_then(|i| i.as_str())
                     .map(std::string::ToString::to_string);
-                blocks.push(TypedBlock::ToolResult {
-                    content: item.get("content").cloned(),
-                    tool_use_id,
-                });
+                blocks.push((
+                    source_index,
+                    TypedBlock::ToolResult {
+                        content: item.get("content").cloned(),
+                        tool_use_id,
+                    },
+                ));
             }
             Some("thinking") => {
                 // Real signed Anthropic thinking blocks carry the reasoning in
@@ -403,7 +416,7 @@ pub(crate) fn split_content_blocks(v: &serde_json::Value) -> Vec<TypedBlock> {
                     .and_then(|t| t.as_str())
                     .or_else(|| item.get("text").and_then(|t| t.as_str()))
                 {
-                    blocks.push(TypedBlock::Thinking(text.to_string()));
+                    blocks.push((source_index, TypedBlock::Thinking(text.to_string())));
                 }
             }
             _ => {}
