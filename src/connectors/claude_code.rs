@@ -991,6 +991,11 @@ struct ClaudeSourceProjector {
     source_kind: &'static str,
 }
 impl crate::source_mapping::SourceProjector for ClaudeSourceProjector {
+    fn needs_native_value(&self) -> bool {
+        // A suppressed whole document yields no message, so the reader must not
+        // build the native `serde_json::Value` for it.
+        !self.suppress_document_messages
+    }
     fn project(
         &mut self,
         val: &Value,
@@ -1105,6 +1110,31 @@ impl crate::source_mapping::SourceProjector for ClaudeSourceProjector {
             }),
             messages,
         })
+    }
+}
+
+#[cfg(test)]
+impl ClaudeSourceProjector {
+    /// Test-only constructor for the suppression-derived reader contract; every
+    /// other field stays at its empty value and is not exercised.
+    fn probe(suppress_document_messages: bool) -> Self {
+        Self {
+            path: PathBuf::new(),
+            external_id_root: None,
+            format: crate::SourceFormat::JsonDocument,
+            compact_message_extra: false,
+            suppress_document_messages,
+            messages: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            workspace: None,
+            session_id: None,
+            cli_session_id: None,
+            git_branch: None,
+            json_title: None,
+            permission_mode: None,
+            source_kind: "claude_code",
+        }
     }
 }
 
@@ -1710,6 +1740,17 @@ mod tests {
             crate::SourceFormat::JsonDocument,
             limit - 1
         ));
+
+        // The reader gate follows the same predicate: a suppressed document
+        // never asks the reader for a native value, and a document exactly at
+        // the limit still does.
+        use crate::source_mapping::SourceProjector as _;
+        let suppressed = document_messages_suppressed(crate::SourceFormat::JsonDocument, limit + 1);
+        assert!(suppressed);
+        assert!(!ClaudeSourceProjector::probe(suppressed).needs_native_value());
+        let eligible = document_messages_suppressed(crate::SourceFormat::JsonDocument, limit);
+        assert!(!eligible);
+        assert!(ClaudeSourceProjector::probe(eligible).needs_native_value());
     }
     use serde_json::json;
     use std::fs;

@@ -101,6 +101,13 @@ pub trait SourceMappingSink: SourceRecordSink {
 
 /// Internal parser state; implementations record claims at their message push.
 pub(crate) trait SourceProjector {
+    /// Whether the reader must materialize a native `serde_json::Value` for a
+    /// record. A projector whose native projection produces no message answers
+    /// `false`, so the reader skips the whole-document conversion and still
+    /// delivers the lossless record, its claims and the read facts unchanged.
+    fn needs_native_value(&self) -> bool {
+        true
+    }
     fn project(
         &mut self,
         value: &Value,
@@ -152,9 +159,12 @@ impl<P: SourceProjector> SourceRecordSink for MappingReader<'_, P> {
         mut record: SourceRecordOutcome,
     ) -> Result<SourceSinkControl, SourceSinkFailure> {
         let mut claims = Vec::new();
+        // The conversion is message-only work: a projector that declares it
+        // needs no native value still receives the untouched lossless record.
         if let Some(value) = record
             .value
             .as_ref()
+            .filter(|_| self.projector.needs_native_value())
             .and_then(crate::LosslessSourceValue::legacy_value)
         {
             match self.projector.project(&value, &record.locator) {
@@ -267,4 +277,187 @@ pub(crate) fn scan_projected<P: SourceProjector>(
         callback_result(&reader.sink.on_record_claims(locator, claims), &finish)?;
     }
     Ok(finish)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source_records::{legacy_value_calls, reset_legacy_value_calls};
+    use crate::{LosslessSourceValue, Sha256Digest};
+
+    #[derive(Default)]
+    struct ProbeSink {
+        records: Vec<SourceRecordOutcome>,
+        claims: Vec<(SourceRecordLocator, Vec<SourceMappingClaim>)>,
+    }
+
+    impl SourceRecordSink for ProbeSink {
+        fn on_record(
+            &mut self,
+            record: SourceRecordOutcome,
+        ) -> Result<SourceSinkControl, SourceSinkFailure> {
+            self.records.push(record);
+            Ok(SourceSinkControl::Continue)
+        }
+    }
+
+    impl SourceMappingSink for ProbeSink {
+        fn on_record_claims(
+            &mut self,
+            locator: SourceRecordLocator,
+            claims: Vec<SourceMappingClaim>,
+        ) -> Result<SourceSinkControl, SourceSinkFailure> {
+            self.claims.push((locator, claims));
+            Ok(SourceSinkControl::Continue)
+        }
+        fn on_conversation(
+            &mut self,
+            _item: SourceMappedConversation,
+        ) -> Result<SourceSinkControl, SourceSinkFailure> {
+            Ok(SourceSinkControl::Continue)
+        }
+        fn on_diagnostic(
+            &mut self,
+            _item: SourceMappingDiagnostic,
+        ) -> Result<SourceSinkControl, SourceSinkFailure> {
+            Ok(SourceSinkControl::Continue)
+        }
+    }
+
+    struct ProbeProjector {
+        wants_native_value: bool,
+        project_calls: u64,
+    }
+
+    impl SourceProjector for ProbeProjector {
+        fn needs_native_value(&self) -> bool {
+            self.wants_native_value
+        }
+        fn project(
+            &mut self,
+            _value: &Value,
+            _locator: &SourceRecordLocator,
+        ) -> Result<Vec<SourceMappingClaim>, &'static str> {
+            self.project_calls += 1;
+            Ok(Vec::new())
+        }
+        fn finish(self) -> Option<NormalizedConversation> {
+            None
+        }
+    }
+
+    /// One reader pass with a probe projector, recording the conversion count
+    /// this thread performed and what the reader delivered.
+    struct ProbeRun {
+        sink: ProbeSink,
+        project_calls: u64,
+        rejections: u64,
+        conversions: u64,
+        reader_records: Vec<(SourceRecordLocator, Vec<SourceMappingClaim>)>,
+    }
+
+    fn run(wants_native_value: bool, record: SourceRecordOutcome) -> ProbeRun {
+        reset_legacy_value_calls();
+        let mut sink = ProbeSink::default();
+        let (project_calls, rejections, reader_records) = {
+            let mut reader = MappingReader {
+                projector: ProbeProjector {
+                    wants_native_value,
+                    project_calls: 0,
+                },
+                sink: &mut sink,
+                records: Vec::new(),
+                rejections: 0,
+            };
+            reader.on_record(record).unwrap();
+            (
+                reader.projector.project_calls,
+                reader.rejections,
+                reader.records.clone(),
+            )
+        };
+        ProbeRun {
+            sink,
+            project_calls,
+            rejections,
+            conversions: legacy_value_calls(),
+            reader_records,
+        }
+    }
+
+    fn parsed_record(ordinal: u64) -> SourceRecordOutcome {
+        SourceRecordOutcome {
+            locator: SourceRecordLocator {
+                ordinal,
+                record_pointer: format!("/{ordinal}"),
+                byte_start: 0,
+                byte_end: 8,
+            },
+            record_byte_len: 8,
+            terminator_len: 0,
+            source_record_sha256: Sha256Digest::of(b"probe"),
+            value: Some(LosslessSourceValue::Object(vec![(
+                "k".to_string(),
+                LosslessSourceValue::String("v".to_string()),
+            )])),
+            parse_state: SourceParseState::Parsed,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// A projector that declares it needs no native value must skip the whole
+    /// document conversion, while the lossless record, its claim and the sink
+    /// delivery stay exactly as they are; the normal path still converts once.
+    #[test]
+    fn suppressed_projection_skips_the_native_conversion() {
+        let suppressed = run(false, parsed_record(0));
+        assert_eq!(suppressed.conversions, 0, "suppressed conversion count");
+        assert_eq!(suppressed.project_calls, 0, "suppressed project calls");
+        assert_eq!(suppressed.rejections, 0);
+        assert_eq!(suppressed.sink.records.len(), 1);
+        assert!(
+            suppressed.sink.records[0].value.is_some(),
+            "the lossless record stays complete"
+        );
+        assert_eq!(suppressed.reader_records.len(), 1);
+        assert_eq!(suppressed.reader_records[0].0.ordinal, 0);
+        assert_eq!(suppressed.reader_records[0].1.len(), 1);
+        assert_eq!(
+            suppressed.reader_records[0].1[0].evidence_kind,
+            "no_message"
+        );
+        assert_eq!(
+            suppressed.reader_records[0].1[0].mapping_state,
+            "standalone"
+        );
+
+        let normal = run(true, parsed_record(0));
+        assert_eq!(normal.conversions, 1, "normal conversion count");
+        assert_eq!(normal.project_calls, 1, "normal project calls");
+        assert!(normal.sink.records[0].value.is_some());
+        assert_eq!(normal.reader_records[0].1[0].evidence_kind, "no_message");
+    }
+
+    /// A failed parse keeps its own claim and never becomes a conversion or a
+    /// success on the suppressed path.
+    #[test]
+    fn suppressed_projection_keeps_parse_failures_unmapped() {
+        let mut failed = parsed_record(0);
+        failed.value = None;
+        failed.parse_state = SourceParseState::ParseFailed;
+        failed
+            .diagnostics
+            .push(SourceDiagnostic::code("unexpected_token"));
+
+        let run = run(false, failed);
+        assert_eq!(run.conversions, 0);
+        assert_eq!(run.project_calls, 0);
+        assert_eq!(run.reader_records[0].1.len(), 1);
+        assert_eq!(run.reader_records[0].1[0].evidence_kind, "parse_failed");
+        assert_eq!(run.reader_records[0].1[0].mapping_state, "unmapped");
+        assert_eq!(run.sink.records.len(), 1);
+        assert!(run.sink.records[0].value.is_none());
+        assert_eq!(run.sink.records[0].diagnostics.len(), 1);
+        assert_eq!(run.sink.records[0].diagnostics[0].code, "unexpected_token");
+    }
 }

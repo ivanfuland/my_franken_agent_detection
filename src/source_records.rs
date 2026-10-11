@@ -757,10 +757,30 @@ impl LosslessSourceValue {
 
     /// Retain fixed native JSON conversion behavior only for legacy projection.
     pub(crate) fn legacy_value(&self) -> Option<serde_json::Value> {
+        #[cfg(test)]
+        LEGACY_VALUE_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut bytes = Vec::new();
         self.write_canonical(&mut bytes).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
+}
+
+// Test-only probe for the reader's conversion gate. It counts this thread's
+// whole-document conversions so a test can show that a projector which declares
+// it needs no native value never triggers one. It is not a product counter.
+#[cfg(test)]
+thread_local! {
+    static LEGACY_VALUE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_value_calls() -> u64 {
+    LEGACY_VALUE_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_legacy_value_calls() {
+    LEGACY_VALUE_CALLS.with(|calls| calls.set(0));
 }
 
 // Destruction must not reintroduce a stack-depth limit into the source reader.
