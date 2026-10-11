@@ -711,10 +711,11 @@ fn conversation_parity_comparison_is_not_vacuous() {
 const CODEX_ROLLOUT_LINE: &[u8] =
     br#"{"type":"response_item","timestamp":"2026-10-10T10:00:00Z","payload":{"role":"user","content":"hello"}}"#;
 
-/// Every real Codex session lives below a `sessions` directory. Legacy `scan`
-/// measures `external_id` from that directory, so the source-aware path must
-/// reproduce it from the frozen discovery alone for each root shape whose
-/// locator carries the sessions directory as a component.
+/// Legacy `scan` measures the Codex `external_id` from the sessions directory,
+/// so a root whose locator carries a `sessions` component must drop it; a root
+/// that already is the sessions directory, or that has none, keeps its full
+/// locator. This case builds one `.codex/sessions/YYYY/MM/DD` layout to cover
+/// all three root shapes the frozen discovery can express.
 #[test]
 fn codex_external_id_matches_legacy_for_sessions_root_shapes() {
     let stem = "rollout-2026-10-10T10-00-00-a";
@@ -743,7 +744,7 @@ fn codex_external_id_matches_legacy_for_sessions_root_shapes() {
         Some(expected.as_str()),
         "legacy default root"
     );
-    let (_dir, sealed) = source_with_locator(
+    let (_dir, default_sealed) = source_with_locator(
         CODEX_ROLLOUT_LINE,
         SourceFormat::Jsonl,
         "codex",
@@ -751,7 +752,7 @@ fn codex_external_id_matches_legacy_for_sessions_root_shapes() {
         &format!("sessions/2026/10/10/{file}"),
         rollout.clone(),
     );
-    let sink = scan_sealed(&CodexConnector::new(), &sealed);
+    let sink = scan_sealed(&CodexConnector::new(), &default_sealed);
     assert_eq!(sink.conversations.len(), 1);
     assert_eq!(
         sink.conversations[0].conversation.external_id.as_deref(),
@@ -828,6 +829,29 @@ fn codex_external_id_matches_legacy_for_sessions_root_shapes() {
         sink.conversations[0].conversation.external_id.as_deref(),
         Some(stem),
         "source-aware root without sessions"
+    );
+
+    // The frozen identity depends on the sealed discovery, not on the original
+    // live file. Move that file out of the scanned tree and read the same
+    // sealed context again: the whole conversation and its identity must not
+    // change.
+    let before = scan_sealed(&CodexConnector::new(), &default_sealed);
+    assert_eq!(before.conversations.len(), 1);
+    fs::rename(&rollout, dir.path().join("moved-away.jsonl")).unwrap();
+    assert!(!rollout.exists());
+    let after = scan_sealed(&CodexConnector::new(), &default_sealed);
+    assert_eq!(after.conversations.len(), 1);
+    assert!(
+        conversations_identical(
+            &before.conversations[0].conversation,
+            &after.conversations[0].conversation
+        ),
+        "the sealed identity must not follow the live path"
+    );
+    assert_eq!(
+        after.conversations[0].conversation.external_id.as_deref(),
+        Some(expected.as_str()),
+        "source-aware identity after the live file moved away"
     );
 }
 
