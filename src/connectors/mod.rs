@@ -62,6 +62,24 @@ use crate::{AgentDetectError, AgentDetectOptions, detect_installed_agents};
 /// Each connector knows how to detect whether a particular coding agent
 /// is installed and how to scan its conversation history.
 pub trait Connector {
+    /// Read a sealed source and publish its original records and proven message links.
+    /// Connectors without this capability fail explicitly without invoking legacy scans.
+    // `SourceReadFailure` carries the frozen inline recovery state (partial `Finish`,
+    // next cursor and diagnostic), so the error type is large by contract; boxing it
+    // would change this published signature. Layout exception recorded under the
+    // 2026-10-10 clippy ruling, not a blanket crate exemption.
+    #[allow(clippy::result_large_err)]
+    fn scan_source_aware(
+        &self,
+        sealed: &crate::SealedInputContext,
+        _sink: &mut dyn crate::SourceMappingSink,
+    ) -> Result<crate::SourceInputFinish, crate::SourceReadFailure> {
+        Err(crate::SourceReadFailure::before_read(
+            sealed,
+            crate::SourceReadFailureKind::Unsupported,
+        ))
+    }
+
     /// Detect whether this agent is installed on the system.
     fn detect(&self) -> DetectionResult;
 

@@ -21,6 +21,7 @@ dirs = "6"
 # --- Optional: connector infrastructure ---
 anyhow = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+sha2 = { version = "=0.10.9", optional = true }
 walkdir = { version = "2", optional = true }
 tracing = { version = "0.1", optional = true }
 dotenvy = { version = "0.15", optional = true }
@@ -41,6 +42,7 @@ default = []
 connectors = [
     "dep:anyhow",
     "dep:serde_json",
+    "dep:sha2",
     "dep:walkdir",
     "dep:tracing",
     "dep:dotenvy",
@@ -65,6 +67,10 @@ all-connectors = ["connectors", "chatgpt", "cursor", "opencode", "goose", "herme
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+
+[[example]]
+name = "source_contract_export"
+required-features = ["connectors"]
 
 [lints.rust]
 unsafe_code = "forbid"

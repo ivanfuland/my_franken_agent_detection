@@ -1,0 +1,13 @@
+{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"session-a","cwd":"/fixture/workspace"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"duplicate"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"cached_input_tokens":1,"output_tokens":11,"reasoning_output_tokens":2,"total_tokens":21},"model_context_window":128000,"total_token_usage":{"input_tokens":70,"cached_input_tokens":10,"output_tokens":110,"reasoning_output_tokens":20,"total_tokens":180}},"rate_limits":null}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-a","output":""}}
+{"type":"response_item","payload":{"type":"reasoning","encrypted_content":"opaque-placeholder"}}
+{"type":"response_item","raw_role":"reserved","payload":{"type":"message","role":"assistant","content":"rejected"}}
+{"type":"response_item","encrypted_content":"reserved","payload":{"type":"message","role":"assistant","content":"rejected"}}
+{"type":"response_item","payload":{"type":1}}
+{"type":"response_item","payload":{"type":"reasoning","summary":"invalid"}}
+{"type":"response_item","payload":{"type":"agent_message","content":null}}
+{"type":"session_meta","timestamp":1,"payload":{"cwd":"/fixture/workspace"}}
+{"type":"event_msg","payload":{"type":"token_count","info":false}}

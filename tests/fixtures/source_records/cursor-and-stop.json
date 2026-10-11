@@ -1,0 +1,7 @@
+{
+  "source": "{\"k\":1}\ninvalid\n{\"k\":3}\n",
+  "stop_after_first": {"next_ordinal": 2, "next_byte_start": 8},
+  "error_on_first": {"next_ordinal": 1, "next_byte_start": 0},
+  "records": 3,
+  "parse_failed": 1
+}

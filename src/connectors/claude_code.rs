@@ -22,6 +22,17 @@ pub struct ClaudeCodeConnector;
 
 const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Frozen Claude Code whole-document message-eligibility limit. The accepted
+/// native projection yields no messages above it, while the source IR is still
+/// read in full; JSONL inputs never use this limit.
+const DOCUMENT_MESSAGE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Whether a Claude Code input still projects messages. Only whole documents
+/// strictly above the frozen limit stop projecting; exactly the limit does not.
+const fn document_messages_suppressed(format: crate::SourceFormat, byte_len: u64) -> bool {
+    matches!(format, crate::SourceFormat::JsonDocument) && byte_len > DOCUMENT_MESSAGE_LIMIT_BYTES
+}
+
 impl Default for ClaudeCodeConnector {
     fn default() -> Self {
         Self::new()
@@ -936,7 +947,742 @@ fn scan_claude_with_callback_with_exclusions(
     Ok(())
 }
 
+/// Mutable projection state shared by the per-shape Claude handlers.
+struct ClaudeProjection {
+    compact_message_extra: bool,
+    messages: Vec<NormalizedMessage>,
+    claims: Vec<crate::SourceMappingClaim>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    workspace: Option<PathBuf>,
+    session_id: Option<String>,
+    cli_session_id: Option<String>,
+    git_branch: Option<String>,
+    json_title: Option<String>,
+    permission_mode: Option<String>,
+    source_kind: &'static str,
+}
+
+/// Borrowed per-record facts shared by the Claude block handlers.
+struct ClaudeBlockContext<'a> {
+    locator: &'a crate::SourceRecordLocator,
+    content_pointer: &'a str,
+    role: &'a str,
+    author: &'a Option<String>,
+    created: Option<i64>,
+    base_extra: &'a Value,
+}
+
+struct ClaudeSourceProjector {
+    path: PathBuf,
+    external_id_root: Option<PathBuf>,
+    format: crate::SourceFormat,
+    compact_message_extra: bool,
+    suppress_document_messages: bool,
+    messages: Vec<NormalizedMessage>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    workspace: Option<PathBuf>,
+    session_id: Option<String>,
+    cli_session_id: Option<String>,
+    git_branch: Option<String>,
+    json_title: Option<String>,
+    permission_mode: Option<String>,
+    source_kind: &'static str,
+}
+impl crate::source_mapping::SourceProjector for ClaudeSourceProjector {
+    fn needs_native_value(&self) -> bool {
+        // A suppressed whole document yields no message, so the reader must not
+        // build the native `serde_json::Value` for it.
+        !self.suppress_document_messages
+    }
+    fn project(
+        &mut self,
+        val: &Value,
+        locator: &crate::SourceRecordLocator,
+    ) -> Result<Vec<crate::SourceMappingClaim>, &'static str> {
+        if self.suppress_document_messages {
+            // The frozen native projection yields no messages for these documents.
+            // The record is still read and delivered; the caller records the
+            // ordinary standalone/no_message claim for it.
+            return Ok(Vec::new());
+        }
+        let mut pending = ClaudeProjection {
+            compact_message_extra: self.compact_message_extra,
+            claims: Vec::new(),
+            messages: std::mem::take(&mut self.messages),
+            started_at: std::mem::take(&mut self.started_at),
+            ended_at: std::mem::take(&mut self.ended_at),
+            workspace: std::mem::take(&mut self.workspace),
+            session_id: std::mem::take(&mut self.session_id),
+            cli_session_id: std::mem::take(&mut self.cli_session_id),
+            git_branch: std::mem::take(&mut self.git_branch),
+            json_title: std::mem::take(&mut self.json_title),
+            permission_mode: std::mem::take(&mut self.permission_mode),
+            source_kind: std::mem::take(&mut self.source_kind),
+        };
+        let projected = if self.format == crate::SourceFormat::Jsonl {
+            project_claude_jsonl(val, locator, &mut pending)
+        } else {
+            project_claude_document(val, locator, &mut pending, &self.path)
+        };
+        self.messages = pending.messages;
+        self.started_at = pending.started_at;
+        self.ended_at = pending.ended_at;
+        self.workspace = pending.workspace;
+        self.session_id = pending.session_id;
+        self.cli_session_id = pending.cli_session_id;
+        self.git_branch = pending.git_branch;
+        self.json_title = pending.json_title;
+        self.permission_mode = pending.permission_mode;
+        self.source_kind = pending.source_kind;
+        projected.map(|()| pending.claims)
+    }
+    fn finish(self) -> Option<NormalizedConversation> {
+        let Self {
+            path,
+            external_id_root,
+            messages,
+            started_at,
+            ended_at,
+            workspace,
+            session_id,
+            cli_session_id,
+            git_branch,
+            json_title,
+            permission_mode,
+            source_kind,
+            ..
+        } = self;
+        if messages.is_empty() {
+            return None;
+        }
+        let title = json_title.or_else(|| {
+            messages
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| {
+                    m.content
+                        .lines()
+                        .next()
+                        .unwrap_or(&m.content)
+                        .chars()
+                        .take(100)
+                        .collect::<String>()
+                })
+                .or_else(|| {
+                    workspace
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .map(String::from)
+                })
+        });
+
+        Some(NormalizedConversation {
+            agent_slug: "claude_code".into(),
+            external_id: if source_kind == "claude_code_desktop_sidecar" {
+                cli_session_id.clone().or_else(|| session_id.clone())
+            } else {
+                external_id_root
+                    .as_deref()
+                    .and_then(|base| path.strip_prefix(base).ok())
+                    .and_then(|rel| rel.to_str())
+                    .map(std::string::ToString::to_string)
+                    .or_else(|| {
+                        path.file_name()
+                            .and_then(|s| s.to_str())
+                            .map(std::string::ToString::to_string)
+                    })
+            },
+            title,
+            workspace,
+            source_path: path,
+            started_at,
+            ended_at,
+            metadata: serde_json::json!({
+                "source": source_kind,
+                "sessionId": session_id,
+                "cliSessionId": cli_session_id,
+                "gitBranch": git_branch,
+                "permissionMode": permission_mode,
+                "bodyAvailable": source_kind != "claude_code_desktop_sidecar"
+            }),
+            messages,
+        })
+    }
+}
+
+#[cfg(test)]
+impl ClaudeSourceProjector {
+    /// Test-only constructor for the suppression-derived reader contract; every
+    /// other field stays at its empty value and is not exercised.
+    fn probe(suppress_document_messages: bool) -> Self {
+        Self {
+            path: PathBuf::new(),
+            external_id_root: None,
+            format: crate::SourceFormat::JsonDocument,
+            compact_message_extra: false,
+            suppress_document_messages,
+            messages: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            workspace: None,
+            session_id: None,
+            cli_session_id: None,
+            git_branch: None,
+            json_title: None,
+            permission_mode: None,
+            source_kind: "claude_code",
+        }
+    }
+}
+
+/// Project one JSONL Claude record.
+fn project_claude_jsonl(
+    val: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut ClaudeProjection,
+) -> Result<(), &'static str> {
+    if pending.workspace.is_none() {
+        pending.workspace = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+    }
+    if pending.session_id.is_none() {
+        pending.session_id = val
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+    }
+    if pending.git_branch.is_none() {
+        pending.git_branch = val
+            .get("gitBranch")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+    }
+
+    let entry_type = val.get("type").and_then(|v| v.as_str());
+    let inner_role = val.get("message").and_then(|message| message.get("role"));
+    let message_role = match (entry_type, inner_role) {
+        (Some("user" | "assistant" | "message"), Some(Value::String(role)))
+            if matches!(role.as_str(), "user" | "assistant") =>
+        {
+            Some(role.as_str())
+        }
+        (Some(role @ ("user" | "assistant")), None) => Some(role),
+        _ => None,
+    };
+    // Claude `system` records carry several subtypes (spec §3.3,
+    // P1-2): `away_summary` has real content and becomes an
+    // `assistant` message while retaining `raw_role=system`;
+    // `turn_duration`/`stop_hook_summary` are pure metrics, and
+    // everything else (`permission-mode`/`mode`/`last-prompt`,
+    // covered by top-level `type` values other than `system` and
+    // already excluded above) is config noise — both classes are
+    // dropped explicitly rather than silently mis-typed.
+    let is_system_away_summary = entry_type == Some("system")
+        && val.get("subtype").and_then(|v| v.as_str()) == Some("away_summary");
+    let raw_role = if is_system_away_summary {
+        Some("system")
+    } else {
+        message_role
+    };
+    let Some(raw_role) = raw_role else {
+        return Ok(());
+    };
+
+    let created = val.get("timestamp").and_then(parse_timestamp);
+
+    pending.started_at = match (pending.started_at, created) {
+        (Some(curr), Some(ts)) => Some(curr.min(ts)),
+        (None, Some(ts)) => Some(ts),
+        (other, None) => other,
+    };
+    pending.ended_at = match (pending.ended_at, created) {
+        (Some(curr), Some(ts)) => Some(curr.max(ts)),
+        (None, Some(ts)) => Some(ts),
+        (Some(curr), None) => Some(curr),
+        (None, None) => None,
+    };
+
+    let projected_extra = if pending.compact_message_extra {
+        ClaudeCodeConnector::compact_message_extra(val)
+    } else {
+        val.clone()
+    };
+    let base_extra =
+        add_raw_role(val, projected_extra, raw_role).map_err(|_| "projection_reserved_raw_role")?;
+    if is_system_away_summary {
+        push_claude_away_summary(val, locator, pending, created, base_extra)?;
+        return Ok(());
+    }
+
+    let role = raw_role;
+    let author = if role == "assistant" {
+        val.get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    } else {
+        None
+    };
+    let content_pointer = if val.get("message").and_then(|m| m.get("content")).is_some() {
+        "/message/content"
+    } else {
+        "/content"
+    };
+    let context = ClaudeBlockContext {
+        locator,
+        content_pointer,
+        role,
+        author: &author,
+        created,
+        base_extra: &base_extra,
+    };
+    project_claude_content(val, locator, pending, &context)
+}
+
+/// Claude `system`+`away_summary` records become one assistant message.
+fn push_claude_away_summary(
+    val: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut ClaudeProjection,
+    created: Option<i64>,
+    base_extra: Value,
+) -> Result<(), &'static str> {
+    let content_str =
+        ClaudeCodeConnector::non_empty_json_string(val, "content").unwrap_or_default();
+    if !content_str.trim().is_empty() {
+        crate::source_mapping::push_message(
+            &mut pending.messages,
+            &mut pending.claims,
+            locator,
+            vec!["/content".into()],
+            "prose",
+            NormalizedMessage {
+                idx: 0,
+                role: "assistant".to_string(),
+                author: None,
+                created_at: created,
+                content: content_str,
+                extra: base_extra,
+                invocations: Vec::new(),
+                snippets: Vec::new(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Dispatch one record's `content` value.
+fn project_claude_content(
+    val: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut ClaudeProjection,
+    context: &ClaudeBlockContext<'_>,
+) -> Result<(), &'static str> {
+    let content_val = val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .or_else(|| val.get("content"));
+    match content_val {
+        Some(Value::Array(_)) => {
+            project_claude_blocks(pending, context, content_val.unwrap())?;
+        }
+        Some(other) => {
+            // Not a content-block array (e.g. a plain string) — no
+            // tool_use/tool_result/thinking blocks are possible here, so there
+            // are no invocations to extract.
+            let content_str = flatten_content(other);
+            if !content_str.trim().is_empty() {
+                crate::source_mapping::push_message(
+                    &mut pending.messages,
+                    &mut pending.claims,
+                    locator,
+                    vec![context.content_pointer.to_string()],
+                    "prose",
+                    NormalizedMessage {
+                        idx: 0,
+                        role: context.role.to_string(),
+                        author: context.author.clone(),
+                        created_at: context.created,
+                        content: content_str,
+                        extra: context.base_extra.clone(),
+                        invocations: Vec::new(),
+                        snippets: Vec::new(),
+                    },
+                )?;
+            }
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn project_claude_blocks(
+    pending: &mut ClaudeProjection,
+    context: &ClaudeBlockContext<'_>,
+    content_val: &Value,
+) -> Result<(), &'static str> {
+    let blocks = crate::connectors::utils::split_content_blocks_indexed(content_val);
+    let mut prose_pointers = Vec::new();
+    let mut prose = String::new();
+    for (source_index, block) in &blocks {
+        if let TypedBlock::Text(text) = block {
+            prose_pointers.push(format!("{}/{}", context.content_pointer, source_index));
+            if !prose.is_empty() {
+                prose.push('\n');
+            }
+            prose.push_str(text);
+        }
+    }
+    if !prose.trim().is_empty() {
+        crate::source_mapping::push_message(
+            &mut pending.messages,
+            &mut pending.claims,
+            context.locator,
+            prose_pointers,
+            "prose",
+            NormalizedMessage {
+                idx: 0,
+                role: context.role.to_string(),
+                author: context.author.clone(),
+                created_at: context.created,
+                content: prose,
+                extra: context.base_extra.clone(),
+                invocations: Vec::new(),
+                snippets: Vec::new(),
+            },
+        )?;
+    }
+    for (source_index, block) in blocks {
+        push_claude_block(block, source_index, context, pending)?;
+    }
+    Ok(())
+}
+
+fn push_claude_block(
+    block: TypedBlock,
+    source_index: usize,
+    ctx: &ClaudeBlockContext<'_>,
+    pending: &mut ClaudeProjection,
+) -> Result<(), &'static str> {
+    match block {
+        TypedBlock::Text(_) => {}
+        TypedBlock::ToolCall { name, input, id } => {
+            if ctx.role != "assistant" {
+                return Ok(());
+            }
+            push_claude_tool_call(name, input, id, source_index, ctx, pending)?;
+        }
+        TypedBlock::ToolResult {
+            content,
+            tool_use_id,
+        } => {
+            if ctx.role != "user" {
+                return Ok(());
+            }
+            push_claude_tool_result(
+                content.as_ref(),
+                tool_use_id.as_deref(),
+                source_index,
+                ctx,
+                pending,
+            )?;
+        }
+        TypedBlock::Thinking(text) => {
+            if ctx.role != "assistant" {
+                return Ok(());
+            }
+            push_claude_thinking(text, source_index, ctx, pending)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// `tool_use` block: one `tool_call` message.
+fn push_claude_tool_call(
+    name: String,
+    input: Option<Value>,
+    id: Option<String>,
+    source_index: usize,
+    ctx: &ClaudeBlockContext<'_>,
+    pending: &mut ClaudeProjection,
+) -> Result<(), &'static str> {
+    if ctx.role != "assistant" {
+        return Ok(());
+    }
+    let content = ClaudeCodeConnector::render_tool_call_content(&name, input.as_ref());
+    let mut extra = ctx.base_extra.clone();
+    if let Value::Object(map) = &mut extra {
+        if let Some(ref call_id) = id {
+            map.insert("tool_call_id".to_string(), Value::String(call_id.clone()));
+        }
+        map.insert(
+            "tool_call_args".to_string(),
+            input.clone().unwrap_or(Value::Null),
+        );
+    }
+    // tool_call/tool_result pairing is via
+    // this explicit id (extra["tool_call_id"]),
+    // never content order (spec P-原则-3).
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        ctx.locator,
+        vec![format!("{}/{source_index}", ctx.content_pointer)],
+        "tool_call",
+        NormalizedMessage {
+            idx: 0,
+            role: "tool_call".to_string(),
+            author: ctx.author.clone(),
+            created_at: ctx.created,
+            content,
+            extra,
+            invocations: vec![NormalizedInvocation {
+                kind: "tool".to_string(),
+                name,
+                raw_name: None,
+                call_id: id,
+                arguments: input,
+            }],
+            snippets: Vec::new(),
+        },
+    )?;
+
+    Ok(())
+}
+
+/// `tool_result` block: one `tool_result` message.
+fn push_claude_tool_result(
+    content: Option<&Value>,
+    tool_use_id: Option<&str>,
+    source_index: usize,
+    ctx: &ClaudeBlockContext<'_>,
+    pending: &mut ClaudeProjection,
+) -> Result<(), &'static str> {
+    if ctx.role != "user" {
+        return Ok(());
+    }
+    let content_str = ClaudeCodeConnector::render_tool_result_content(content);
+    let mut extra = ctx.base_extra.clone();
+    set_tool_result_pairing(&mut extra, tool_use_id).map_err(|_| "projection_reserved_raw_role")?;
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        ctx.locator,
+        vec![format!("{}/{source_index}", ctx.content_pointer)],
+        "tool_result",
+        NormalizedMessage {
+            idx: 0,
+            role: "tool_result".to_string(),
+            author: None,
+            created_at: ctx.created,
+            content: content_str,
+            extra,
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        },
+    )?;
+
+    Ok(())
+}
+
+/// `thinking` block: one `reasoning` message.
+fn push_claude_thinking(
+    text: String,
+    source_index: usize,
+    ctx: &ClaudeBlockContext<'_>,
+    pending: &mut ClaudeProjection,
+) -> Result<(), &'static str> {
+    if ctx.role != "assistant" {
+        return Ok(());
+    }
+    crate::source_mapping::push_message(
+        &mut pending.messages,
+        &mut pending.claims,
+        ctx.locator,
+        vec![format!("{}/{source_index}", ctx.content_pointer)],
+        "reasoning",
+        NormalizedMessage {
+            idx: 0,
+            role: "reasoning".to_string(),
+            author: ctx.author.clone(),
+            created_at: ctx.created,
+            content: text,
+            extra: ctx.base_extra.clone(),
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Desktop sidecar metadata document: one fallback prose message.
+fn push_claude_sidecar_message(
+    val: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut ClaudeProjection,
+) -> Result<(), &'static str> {
+    if let Some(message) = ClaudeCodeConnector::desktop_sidecar_metadata_message(val) {
+        pending.source_kind = "claude_code_desktop_sidecar";
+        crate::source_mapping::push_message(
+            &mut pending.messages,
+            &mut pending.claims,
+            locator,
+            vec![String::new()],
+            "prose",
+            message,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Whole-document Claude JSON projection.
+fn project_claude_document(
+    val: &Value,
+    locator: &crate::SourceRecordLocator,
+    pending: &mut ClaudeProjection,
+    path: &Path,
+) -> Result<(), &'static str> {
+    pending.json_title = ClaudeCodeConnector::non_empty_json_string(val, "title");
+    if pending.workspace.is_none() {
+        pending.workspace =
+            ClaudeCodeConnector::non_empty_json_string(val, "cwd").map(PathBuf::from);
+    }
+    if pending.session_id.is_none() {
+        pending.session_id = ClaudeCodeConnector::non_empty_json_string(val, "sessionId");
+    }
+    if pending.cli_session_id.is_none() {
+        pending.cli_session_id = ClaudeCodeConnector::non_empty_json_string(val, "cliSessionId");
+    }
+    if pending.permission_mode.is_none() {
+        pending.permission_mode = ClaudeCodeConnector::non_empty_json_string(val, "permissionMode");
+    }
+    let sidecar_created_at = val.get("createdAt").and_then(parse_timestamp);
+    let sidecar_last_activity_at = val.get("lastActivityAt").and_then(parse_timestamp);
+    pending.started_at = pending
+        .started_at
+        .or(sidecar_created_at)
+        .or(sidecar_last_activity_at);
+    pending.ended_at = pending
+        .ended_at
+        .or(sidecar_last_activity_at)
+        .or(sidecar_created_at);
+
+    if let Some(arr) = val.get("messages").and_then(|m| m.as_array()) {
+        for (source_index, item) in arr.iter().enumerate() {
+            let role = item
+                .get("role")
+                .or_else(|| item.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("agent");
+            let created = item
+                .get("timestamp")
+                .or_else(|| item.get("time"))
+                .and_then(parse_timestamp);
+
+            pending.started_at = match (pending.started_at, created) {
+                (Some(curr), Some(ts)) => Some(curr.min(ts)),
+                (None, Some(ts)) => Some(ts),
+                (other, None) => other,
+            };
+            pending.ended_at = match (pending.ended_at, created) {
+                (Some(curr), Some(ts)) => Some(curr.max(ts)),
+                (None, Some(ts)) => Some(ts),
+                (Some(curr), None) => Some(curr),
+                (None, None) => None,
+            };
+
+            let content_val = item.get("content").or_else(|| item.get("text"));
+            let content_str = content_val.map(flatten_content).unwrap_or_default();
+
+            if content_str.trim().is_empty() {
+                continue;
+            }
+
+            crate::source_mapping::push_message(
+                &mut pending.messages,
+                &mut pending.claims,
+                locator,
+                vec![format!("/messages/{source_index}")],
+                "prose",
+                NormalizedMessage {
+                    idx: 0,
+                    role: role.to_string(),
+                    author: None,
+                    created_at: created,
+                    content: content_str,
+                    extra: if pending.compact_message_extra {
+                        ClaudeCodeConnector::compact_message_extra(item)
+                    } else {
+                        item.clone()
+                    },
+                    invocations: content_val
+                        .map_or_else(Vec::new, extract_invocations_from_content_blocks),
+                    snippets: Vec::new(),
+                },
+            )?;
+        }
+    }
+    if pending.messages.is_empty()
+        && ClaudeCodeConnector::path_is_desktop_sidecar(path)
+        && let Some(message) = ClaudeCodeConnector::desktop_sidecar_metadata_message(val)
+    {
+        pending.source_kind = "claude_code_desktop_sidecar";
+        crate::source_mapping::push_message(
+            &mut pending.messages,
+            &mut pending.claims,
+            locator,
+            vec![String::new()],
+            "prose",
+            message,
+        )?;
+    }
+    if pending.messages.is_empty() && ClaudeCodeConnector::path_is_desktop_sidecar(path) {
+        push_claude_sidecar_message(val, locator, pending)?;
+    }
+
+    Ok(())
+}
+
 impl Connector for ClaudeCodeConnector {
+    fn scan_source_aware(
+        &self,
+        sealed: &crate::SealedInputContext,
+        sink: &mut dyn crate::SourceMappingSink,
+    ) -> Result<crate::SourceInputFinish, crate::SourceReadFailure> {
+        if sealed.discovery.connector != "claude_code" {
+            return Err(crate::SourceReadFailure::before_read(
+                sealed,
+                crate::SourceReadFailureKind::InvalidContext,
+            ));
+        }
+        let projector = ClaudeSourceProjector {
+            path: sealed.discovery.source_path.clone(),
+            external_id_root: Some(sealed.discovery.scan_root.clone()),
+            format: sealed.format,
+            compact_message_extra: Self::should_compact_large_message_extra(Some(sealed.byte_len)),
+            suppress_document_messages: document_messages_suppressed(
+                sealed.format,
+                sealed.byte_len,
+            ),
+            messages: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            workspace: None,
+            session_id: None,
+            cli_session_id: None,
+            git_branch: None,
+            json_title: None,
+            permission_mode: None,
+            source_kind: "claude_code",
+        };
+        crate::source_mapping::scan_projected(sealed, sink, projector)
+    }
+
     fn detect(&self) -> DetectionResult {
         franken_detection_for_connector("claude_code").unwrap_or_else(DetectionResult::not_found)
     }
@@ -970,6 +1716,43 @@ impl Connector for ClaudeCodeConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frozen document message-eligibility boundary: exactly the limit keeps
+    /// projecting, one byte above stops, and JSONL never uses this rule. The rule
+    /// is tested here rather than through the reader, which would need a real
+    /// hundred-megabyte input to exercise the same predicate.
+    #[test]
+    fn document_message_eligibility_boundary() {
+        use crate::source_mapping::SourceProjector as _;
+
+        let limit = DOCUMENT_MESSAGE_LIMIT_BYTES;
+        assert!(!document_messages_suppressed(
+            crate::SourceFormat::JsonDocument,
+            limit
+        ));
+        assert!(document_messages_suppressed(
+            crate::SourceFormat::JsonDocument,
+            limit + 1
+        ));
+        assert!(!document_messages_suppressed(
+            crate::SourceFormat::Jsonl,
+            limit + 1
+        ));
+        assert!(!document_messages_suppressed(
+            crate::SourceFormat::JsonDocument,
+            limit - 1
+        ));
+
+        // The reader gate follows the same predicate: a suppressed document
+        // never asks the reader for a native value, and a document exactly at
+        // the limit still does.
+        let suppressed = document_messages_suppressed(crate::SourceFormat::JsonDocument, limit + 1);
+        assert!(suppressed);
+        assert!(!ClaudeSourceProjector::probe(suppressed).needs_native_value());
+        let eligible = document_messages_suppressed(crate::SourceFormat::JsonDocument, limit);
+        assert!(!eligible);
+        assert!(ClaudeSourceProjector::probe(eligible).needs_native_value());
+    }
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;

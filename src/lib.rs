@@ -14,6 +14,14 @@
 
 #[cfg(feature = "connectors")]
 pub mod connectors;
+#[cfg(feature = "connectors")]
+pub mod source_mapping;
+#[cfg(feature = "connectors")]
+pub mod source_records;
+#[cfg(feature = "connectors")]
+pub use source_mapping::*;
+#[cfg(feature = "connectors")]
+pub use source_records::*;
 pub mod types;
 
 // Re-export core types at crate root for convenience.

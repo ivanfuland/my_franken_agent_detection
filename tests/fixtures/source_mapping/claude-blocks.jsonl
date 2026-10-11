@@ -1,0 +1,6 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"},{"type":"tool_use","name":"ignored"}]}}
+{"type":"assistant","message":{"role":"assistant","model":"model-a","content":[{"type":"text","text":"first"},{"type":"thinking","thinking":""},{"type":"image","data":"placeholder"},{"type":"text","text":"last"},{"type":"tool_use","name":"example","id":"call-a","input":{"n":1}},{"type":"tool_result","content":"wrong owner"}]}}
+{"type":"system","subtype":"away_summary","content":"summary"}
+{"type":"system","subtype":"turn_duration","content":"metric"}
+{"type":"assistant","message":{"role":"developer","content":"filtered"}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-a","content":[]}]}}
