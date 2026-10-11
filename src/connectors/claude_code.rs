@@ -1723,6 +1723,8 @@ mod tests {
     /// hundred-megabyte input to exercise the same predicate.
     #[test]
     fn document_message_eligibility_boundary() {
+        use crate::source_mapping::SourceProjector as _;
+
         let limit = DOCUMENT_MESSAGE_LIMIT_BYTES;
         assert!(!document_messages_suppressed(
             crate::SourceFormat::JsonDocument,
@@ -1744,7 +1746,6 @@ mod tests {
         // The reader gate follows the same predicate: a suppressed document
         // never asks the reader for a native value, and a document exactly at
         // the limit still does.
-        use crate::source_mapping::SourceProjector as _;
         let suppressed = document_messages_suppressed(crate::SourceFormat::JsonDocument, limit + 1);
         assert!(suppressed);
         assert!(!ClaudeSourceProjector::probe(suppressed).needs_native_value());

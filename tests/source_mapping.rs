@@ -208,9 +208,9 @@ fn source_at(
         bytes,
         format,
         connector,
-        path.parent().unwrap().to_path_buf(),
+        path.parent().unwrap(),
         &path.file_name().unwrap().to_string_lossy(),
-        path.to_path_buf(),
+        path,
     )
 }
 
@@ -220,15 +220,15 @@ fn source_with_locator(
     bytes: &[u8],
     format: SourceFormat,
     connector: &str,
-    scan_root: std::path::PathBuf,
+    scan_root: &std::path::Path,
     relative_locator: &str,
-    source_path: std::path::PathBuf,
+    source_path: &std::path::Path,
 ) -> (tempfile::TempDir, SealedInputContext) {
     let (dir, mut sealed) = context(bytes, format);
     sealed.discovery.connector = connector.into();
     sealed.parser_context.connector = connector.into();
-    sealed.discovery.scan_root = scan_root;
-    sealed.discovery.source_path = source_path;
+    sealed.discovery.scan_root = scan_root.to_path_buf();
+    sealed.discovery.source_path = source_path.to_path_buf();
     sealed.discovery.relative_locator = relative_locator.into();
     sealed.parser_context.roots = vec![SourceParserRoot {
         path: sealed.discovery.scan_root.clone(),
@@ -711,6 +711,34 @@ fn conversation_parity_comparison_is_not_vacuous() {
 const CODEX_ROLLOUT_LINE: &[u8] =
     br#"{"type":"response_item","timestamp":"2026-10-10T10:00:00Z","payload":{"role":"user","content":"hello"}}"#;
 
+/// Compare legacy `scan` with the sealed source-aware read for one root shape:
+/// both identities must equal `expected` and the whole conversation structure
+/// must be identical. Returns the projected conversation.
+fn codex_identity(
+    legacy: &NormalizedConversation,
+    sealed: &SealedInputContext,
+    expected: &str,
+    label: &str,
+) -> NormalizedConversation {
+    assert_eq!(
+        legacy.external_id.as_deref(),
+        Some(expected),
+        "legacy {label}"
+    );
+    let mut sink = scan_sealed(&CodexConnector::new(), sealed);
+    assert_eq!(sink.conversations.len(), 1, "{label}");
+    assert_eq!(
+        sink.conversations[0].conversation.external_id.as_deref(),
+        Some(expected),
+        "source-aware {label}"
+    );
+    assert!(conversations_identical(
+        legacy,
+        &sink.conversations[0].conversation
+    ));
+    sink.conversations.swap_remove(0).conversation
+}
+
 /// Legacy `scan` measures the Codex `external_id` from the sessions directory,
 /// so a root whose locator carries a `sessions` component must drop it; a root
 /// that already is the sessions directory, or that has none, keeps its full
@@ -735,65 +763,44 @@ fn codex_external_id_matches_legacy_for_sessions_root_shapes() {
 
     // Default detection: the connector root is the `.codex` data directory, so
     // the frozen locator keeps the whole `sessions/YYYY/MM/DD/...` path.
-    let legacy = CodexConnector::new()
+    let default_legacy = CodexConnector::new()
         .scan(&ScanContext::local_default(codex_dir.clone(), None))
         .unwrap();
-    assert_eq!(legacy.len(), 1);
-    assert_eq!(
-        legacy[0].external_id.as_deref(),
-        Some(expected.as_str()),
-        "legacy default root"
-    );
-    let (_dir, default_sealed) = source_with_locator(
+    assert_eq!(default_legacy.len(), 1);
+    let (_default_dir, default_sealed) = source_with_locator(
         CODEX_ROLLOUT_LINE,
         SourceFormat::Jsonl,
         "codex",
-        codex_dir.clone(),
+        &codex_dir,
         &format!("sessions/2026/10/10/{file}"),
-        rollout.clone(),
+        &rollout,
     );
-    let sink = scan_sealed(&CodexConnector::new(), &default_sealed);
-    assert_eq!(sink.conversations.len(), 1);
-    assert_eq!(
-        sink.conversations[0].conversation.external_id.as_deref(),
-        Some(expected.as_str()),
-        "source-aware default root"
+    codex_identity(
+        &default_legacy[0],
+        &default_sealed,
+        &expected,
+        "default root",
     );
-    assert!(conversations_identical(
-        &legacy[0],
-        &sink.conversations[0].conversation
-    ));
 
     // Explicit sessions root: the locator already starts below `sessions`.
     let sessions = codex_dir.join("sessions");
     let legacy = CodexConnector::new()
         .scan(&ScanContext::with_roots(
-            codex_dir.clone(),
+            codex_dir,
             vec![ScanRoot::local(sessions.clone())],
             None,
         ))
         .unwrap();
     assert_eq!(legacy.len(), 1);
-    assert_eq!(
-        legacy[0].external_id.as_deref(),
-        Some(expected.as_str()),
-        "legacy sessions root"
-    );
-    let (_dir, sealed) = source_with_locator(
+    let (_sessions_dir, sessions_sealed) = source_with_locator(
         CODEX_ROLLOUT_LINE,
         SourceFormat::Jsonl,
         "codex",
-        sessions.clone(),
+        &sessions,
         &format!("2026/10/10/{file}"),
-        rollout.clone(),
+        &rollout,
     );
-    let sink = scan_sealed(&CodexConnector::new(), &sealed);
-    assert_eq!(sink.conversations.len(), 1);
-    assert_eq!(
-        sink.conversations[0].conversation.external_id.as_deref(),
-        Some(expected.as_str()),
-        "source-aware sessions root"
-    );
+    codex_identity(&legacy[0], &sessions_sealed, &expected, "sessions root");
 
     // Explicit root without a `sessions` directory: the locator is the path
     // below the root itself.
@@ -810,48 +817,27 @@ fn codex_external_id_matches_legacy_for_sessions_root_shapes() {
         ))
         .unwrap();
     assert_eq!(legacy.len(), 1);
-    assert_eq!(
-        legacy[0].external_id.as_deref(),
-        Some(stem),
-        "legacy root without sessions"
-    );
-    let (_dir, sealed) = source_with_locator(
+    let (_plain_dir, plain_sealed) = source_with_locator(
         CODEX_ROLLOUT_LINE,
         SourceFormat::Jsonl,
         "codex",
-        plain.clone(),
+        &plain,
         &file,
-        plain_rollout,
+        &plain_rollout,
     );
-    let sink = scan_sealed(&CodexConnector::new(), &sealed);
-    assert_eq!(sink.conversations.len(), 1);
-    assert_eq!(
-        sink.conversations[0].conversation.external_id.as_deref(),
-        Some(stem),
-        "source-aware root without sessions"
-    );
+    codex_identity(&legacy[0], &plain_sealed, stem, "root without sessions");
 
     // The frozen identity depends on the sealed discovery, not on the original
     // live file. Move that file out of the scanned tree and read the same
     // sealed context again: the whole conversation and its identity must not
     // change.
-    let before = scan_sealed(&CodexConnector::new(), &default_sealed);
-    assert_eq!(before.conversations.len(), 1);
     fs::rename(&rollout, dir.path().join("moved-away.jsonl")).unwrap();
     assert!(!rollout.exists());
-    let after = scan_sealed(&CodexConnector::new(), &default_sealed);
-    assert_eq!(after.conversations.len(), 1);
-    assert!(
-        conversations_identical(
-            &before.conversations[0].conversation,
-            &after.conversations[0].conversation
-        ),
-        "the sealed identity must not follow the live path"
-    );
-    assert_eq!(
-        after.conversations[0].conversation.external_id.as_deref(),
-        Some(expected.as_str()),
-        "source-aware identity after the live file moved away"
+    codex_identity(
+        &default_legacy[0],
+        &default_sealed,
+        &expected,
+        "after the live file moved",
     );
 }
 
@@ -889,11 +875,13 @@ fn codex_explicit_file_root_identity_is_not_expressible_in_sealed_discovery() {
     );
 
     // Legacy config Y: the scan root is the file's parent directory. This is
-    // the only tuple the sealed contract can carry for the same file.
+    // the only tuple the sealed contract can carry for the same file, because
+    // it requires `scan_root.join(relative) == source_path` with a non-empty,
+    // dot-free relative locator.
     let parent_root = CodexConnector::new()
         .scan(&ScanContext::with_roots(
             day.clone(),
-            vec![ScanRoot::local(day.clone())],
+            vec![ScanRoot::local(day)],
             None,
         ))
         .unwrap();
@@ -906,9 +894,9 @@ fn codex_explicit_file_root_identity_is_not_expressible_in_sealed_discovery() {
         CODEX_ROLLOUT_LINE,
         SourceFormat::Jsonl,
         "codex",
-        rollout.clone(),
+        &rollout,
         "rollout-a.jsonl",
-        rollout.clone(),
+        &rollout,
     );
     unrepresentable.discovery.relative_locator = String::new();
     unrepresentable.parser_context.relative_locator = String::new();
