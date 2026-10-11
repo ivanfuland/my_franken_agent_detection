@@ -100,6 +100,24 @@ impl CodexConnector {
             .map(Path::to_path_buf)
     }
 
+    /// Reproduce the legacy `external_id` from frozen discovery facts only.
+    ///
+    /// Legacy `scan` measures the identity from the codex sessions directory,
+    /// so the default `~/.codex` root yields `YYYY/MM/DD/rollout-N` and never a
+    /// `sessions/`-prefixed path. The sealed discovery carries the same fact:
+    /// `scan_root` is the connector root, so a leading `sessions` component
+    /// names the sessions directory itself and is dropped before the extension.
+    /// A root that already is the sessions directory, or that has none, keeps
+    /// its full relative locator.
+    fn external_id_from_discovery(discovery: &crate::SourceInputDescriptor) -> Option<String> {
+        let relative = Path::new(&discovery.relative_locator);
+        let identity = match relative.strip_prefix("sessions") {
+            Ok(rest) if !rest.as_os_str().is_empty() => rest,
+            _ => relative,
+        };
+        identity.with_extension("").to_str().map(String::from)
+    }
+
     fn rollout_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let sessions = Self::sessions_dir(root);
@@ -1848,10 +1866,7 @@ impl Connector for CodexConnector {
                 crate::SourceReadFailureKind::InvalidContext,
             ));
         }
-        let external_id = Path::new(&sealed.discovery.relative_locator)
-            .with_extension("")
-            .to_str()
-            .map(String::from);
+        let external_id = Self::external_id_from_discovery(&sealed.discovery);
         let projector = CodexSourceProjector {
             source_path: sealed.discovery.source_path.clone(),
             external_id,

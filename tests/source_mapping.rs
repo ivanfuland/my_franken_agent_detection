@@ -204,20 +204,39 @@ fn source_at(
     connector: &str,
     path: &std::path::Path,
 ) -> (tempfile::TempDir, SealedInputContext) {
+    source_with_locator(
+        bytes,
+        format,
+        connector,
+        path.parent().unwrap().to_path_buf(),
+        &path.file_name().unwrap().to_string_lossy(),
+        path.to_path_buf(),
+    )
+}
+
+/// A sealed context whose discovery mirror is an explicit root, locator and
+/// original path — the only facts a source-aware read may use for identity.
+fn source_with_locator(
+    bytes: &[u8],
+    format: SourceFormat,
+    connector: &str,
+    scan_root: std::path::PathBuf,
+    relative_locator: &str,
+    source_path: std::path::PathBuf,
+) -> (tempfile::TempDir, SealedInputContext) {
     let (dir, mut sealed) = context(bytes, format);
-    let root = path.parent().unwrap().to_path_buf();
     sealed.discovery.connector = connector.into();
     sealed.parser_context.connector = connector.into();
-    sealed.discovery.scan_root = root;
-    sealed.discovery.source_path = path.to_path_buf();
-    sealed.discovery.relative_locator = path.file_name().unwrap().to_string_lossy().into_owned();
+    sealed.discovery.scan_root = scan_root;
+    sealed.discovery.source_path = source_path;
+    sealed.discovery.relative_locator = relative_locator.into();
     sealed.parser_context.roots = vec![SourceParserRoot {
         path: sealed.discovery.scan_root.clone(),
         origin: sealed.discovery.origin.clone(),
         platform: None,
         workspace_rewrites: vec![],
     }];
-    sealed.parser_context.relative_locator = sealed.discovery.relative_locator.clone();
+    sealed.parser_context.relative_locator = relative_locator.into();
     sealed.parser_context_digest = sealed.parser_context.digest().unwrap();
     sealed.input_key = sealed.identity_for(sealed.content_digest).unwrap();
     (dir, sealed)
@@ -685,4 +704,196 @@ fn conversation_parity_comparison_is_not_vacuous() {
     let mut changed_message = base.clone();
     changed_message.messages[0].content.push('!');
     assert!(!conversations_identical(&base, &changed_message), "message");
+}
+
+/// One rollout line the legacy Codex scan already accepts, so both paths must
+/// produce the same single-message conversation.
+const CODEX_ROLLOUT_LINE: &[u8] =
+    br#"{"type":"response_item","timestamp":"2026-10-10T10:00:00Z","payload":{"role":"user","content":"hello"}}"#;
+
+/// Every real Codex session lives below a `sessions` directory. Legacy `scan`
+/// measures `external_id` from that directory, so the source-aware path must
+/// reproduce it from the frozen discovery alone for each root shape whose
+/// locator carries the sessions directory as a component.
+#[test]
+fn codex_external_id_matches_legacy_for_sessions_root_shapes() {
+    let stem = "rollout-2026-10-10T10-00-00-a";
+    let file = format!("{stem}.jsonl");
+    let expected = format!("2026/10/10/{stem}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let codex_dir = dir.path().join(".codex");
+    let day = codex_dir
+        .join("sessions")
+        .join("2026")
+        .join("10")
+        .join("10");
+    fs::create_dir_all(&day).unwrap();
+    let rollout = day.join(&file);
+    fs::write(&rollout, CODEX_ROLLOUT_LINE).unwrap();
+
+    // Default detection: the connector root is the `.codex` data directory, so
+    // the frozen locator keeps the whole `sessions/YYYY/MM/DD/...` path.
+    let legacy = CodexConnector::new()
+        .scan(&ScanContext::local_default(codex_dir.clone(), None))
+        .unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(
+        legacy[0].external_id.as_deref(),
+        Some(expected.as_str()),
+        "legacy default root"
+    );
+    let (_dir, sealed) = source_with_locator(
+        CODEX_ROLLOUT_LINE,
+        SourceFormat::Jsonl,
+        "codex",
+        codex_dir.clone(),
+        &format!("sessions/2026/10/10/{file}"),
+        rollout.clone(),
+    );
+    let sink = scan_sealed(&CodexConnector::new(), &sealed);
+    assert_eq!(sink.conversations.len(), 1);
+    assert_eq!(
+        sink.conversations[0].conversation.external_id.as_deref(),
+        Some(expected.as_str()),
+        "source-aware default root"
+    );
+    assert!(conversations_identical(
+        &legacy[0],
+        &sink.conversations[0].conversation
+    ));
+
+    // Explicit sessions root: the locator already starts below `sessions`.
+    let sessions = codex_dir.join("sessions");
+    let legacy = CodexConnector::new()
+        .scan(&ScanContext::with_roots(
+            codex_dir.clone(),
+            vec![ScanRoot::local(sessions.clone())],
+            None,
+        ))
+        .unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(
+        legacy[0].external_id.as_deref(),
+        Some(expected.as_str()),
+        "legacy sessions root"
+    );
+    let (_dir, sealed) = source_with_locator(
+        CODEX_ROLLOUT_LINE,
+        SourceFormat::Jsonl,
+        "codex",
+        sessions.clone(),
+        &format!("2026/10/10/{file}"),
+        rollout.clone(),
+    );
+    let sink = scan_sealed(&CodexConnector::new(), &sealed);
+    assert_eq!(sink.conversations.len(), 1);
+    assert_eq!(
+        sink.conversations[0].conversation.external_id.as_deref(),
+        Some(expected.as_str()),
+        "source-aware sessions root"
+    );
+
+    // Explicit root without a `sessions` directory: the locator is the path
+    // below the root itself.
+    let plain_dir = tempfile::tempdir().unwrap();
+    let plain = plain_dir.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let plain_rollout = plain.join(&file);
+    fs::write(&plain_rollout, CODEX_ROLLOUT_LINE).unwrap();
+    let legacy = CodexConnector::new()
+        .scan(&ScanContext::with_roots(
+            plain.clone(),
+            vec![ScanRoot::local(plain.clone())],
+            None,
+        ))
+        .unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(
+        legacy[0].external_id.as_deref(),
+        Some(stem),
+        "legacy root without sessions"
+    );
+    let (_dir, sealed) = source_with_locator(
+        CODEX_ROLLOUT_LINE,
+        SourceFormat::Jsonl,
+        "codex",
+        plain.clone(),
+        &file,
+        plain_rollout,
+    );
+    let sink = scan_sealed(&CodexConnector::new(), &sealed);
+    assert_eq!(sink.conversations.len(), 1);
+    assert_eq!(
+        sink.conversations[0].conversation.external_id.as_deref(),
+        Some(stem),
+        "source-aware root without sessions"
+    );
+}
+
+/// Records a limitation of the frozen discovery, not a fix. Legacy discovery
+/// keeps the original root verbatim, so a rollout passed as an explicit file
+/// has the file itself as its root, while the sealed contract requires
+/// `scan_root.join(relative_locator) == source_path` with a non-empty,
+/// dot-free locator. The same file therefore has two legacy roots with two
+/// different identities but only one expressible sealed tuple.
+#[test]
+fn codex_explicit_file_root_identity_is_not_expressible_in_sealed_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex_dir = dir.path().join(".codex");
+    let day = codex_dir
+        .join("sessions")
+        .join("2026")
+        .join("10")
+        .join("10");
+    fs::create_dir_all(&day).unwrap();
+    let rollout = day.join("rollout-a.jsonl");
+    fs::write(&rollout, CODEX_ROLLOUT_LINE).unwrap();
+
+    // Legacy config X: the scan root is the rollout file itself.
+    let file_root = CodexConnector::new()
+        .scan(&ScanContext::with_roots(
+            rollout.clone(),
+            vec![ScanRoot::local(rollout.clone())],
+            None,
+        ))
+        .unwrap();
+    assert_eq!(file_root.len(), 1);
+    assert_eq!(
+        file_root[0].external_id.as_deref(),
+        Some("2026/10/10/rollout-a")
+    );
+
+    // Legacy config Y: the scan root is the file's parent directory. This is
+    // the only tuple the sealed contract can carry for the same file.
+    let parent_root = CodexConnector::new()
+        .scan(&ScanContext::with_roots(
+            day.clone(),
+            vec![ScanRoot::local(day.clone())],
+            None,
+        ))
+        .unwrap();
+    assert_eq!(parent_root.len(), 1);
+    assert_eq!(parent_root[0].external_id.as_deref(), Some("rollout-a"));
+
+    // A descriptor faithful to config X cannot even validate: the empty
+    // locator is rejected, so the file-root shape has no sealed representation.
+    let (_dir, mut unrepresentable) = source_with_locator(
+        CODEX_ROLLOUT_LINE,
+        SourceFormat::Jsonl,
+        "codex",
+        rollout.clone(),
+        "rollout-a.jsonl",
+        rollout.clone(),
+    );
+    unrepresentable.discovery.relative_locator = String::new();
+    unrepresentable.parser_context.relative_locator = String::new();
+    unrepresentable.parser_context_digest = unrepresentable.parser_context.digest().unwrap();
+    unrepresentable.input_key = unrepresentable
+        .identity_for(unrepresentable.content_digest)
+        .unwrap();
+    assert_eq!(
+        unrepresentable.validate().unwrap_err(),
+        SourceReadFailureKind::InvalidContext
+    );
 }
