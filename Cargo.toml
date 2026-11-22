@@ -68,10 +68,6 @@ all-connectors = ["connectors", "chatgpt", "cursor", "opencode", "goose", "herme
 tempfile = "3"
 serial_test = "3"
 
-[[example]]
-name = "source_contract_export"
-required-features = ["connectors"]
-
 [lints.rust]
 unsafe_code = "forbid"
 

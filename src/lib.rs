@@ -15,13 +15,9 @@
 #[cfg(feature = "connectors")]
 pub mod connectors;
 #[cfg(feature = "connectors")]
-pub mod source_mapping;
+pub mod lossless_json;
 #[cfg(feature = "connectors")]
-pub mod source_records;
-#[cfg(feature = "connectors")]
-pub use source_mapping::*;
-#[cfg(feature = "connectors")]
-pub use source_records::*;
+pub use lossless_json::{LosslessSourceValue, SourceDiagnostic, ValidatedJsonNumberText};
 pub mod types;
 
 // Re-export core types at crate root for convenience.
