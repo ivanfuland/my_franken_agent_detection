@@ -21,7 +21,6 @@ dirs = "6"
 # --- Optional: connector infrastructure ---
 anyhow = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
-sha2 = { version = "=0.10.9", optional = true }
 walkdir = { version = "2", optional = true }
 tracing = { version = "0.1", optional = true }
 dotenvy = { version = "0.15", optional = true }
@@ -42,13 +41,14 @@ default = []
 connectors = [
     "dep:anyhow",
     "dep:serde_json",
-    "dep:sha2",
     "dep:walkdir",
     "dep:tracing",
     "dep:dotenvy",
     "dep:bloomfilter",
     "dep:once_cell",
 ]
+# Antigravity: read-only SQLite metadata enrichment from conversation_summaries.db
+antigravity-db = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
 # ChatGPT: AES-256-GCM decryption for v2/v3 encrypted conversations
 chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
 # Cursor: SQLite database access for state.vscdb
@@ -62,7 +62,7 @@ hermes = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
 # Crush: SQLite database access for Charm's Crush agent
 crush = ["connectors", "dep:frankensqlite"]
 # All connectors enabled
-all-connectors = ["connectors", "chatgpt", "cursor", "opencode", "goose", "hermes", "crush"]
+all-connectors = ["connectors", "antigravity-db", "chatgpt", "cursor", "opencode", "goose", "hermes", "crush"]
 
 [dev-dependencies]
 tempfile = "3"

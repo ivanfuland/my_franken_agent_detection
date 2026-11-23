@@ -289,6 +289,63 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
     }
 }
 
+/// Extract token usage from an Antigravity (`agy`) message's raw data.
+#[must_use]
+pub fn extract_antigravity_tokens(extra: &Value) -> ExtractedTokenUsage {
+    let model_name = extra
+        .get("model")
+        .or_else(|| extra.pointer("/cass/model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let provider = model_name
+        .as_deref()
+        .map(|name| normalize_model(name).provider);
+
+    let usage_block = extra.pointer("/cass/token_usage");
+    let input_tokens = usage_block
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(Value::as_i64);
+    let output_tokens = usage_block
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(Value::as_i64);
+    let cache_read_tokens = usage_block
+        .and_then(|u| u.get("cache_read_tokens"))
+        .and_then(Value::as_i64);
+
+    let has_api_data = input_tokens.is_some()
+        || output_tokens.is_some()
+        || cache_read_tokens.is_some()
+        || usage_block
+            .and_then(|u| u.get("data_source"))
+            .and_then(Value::as_str)
+            == Some("api");
+
+    let tool_call_count = extra
+        .pointer("/cass/tool_call_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+        .unwrap_or(0);
+
+    ExtractedTokenUsage {
+        model_name,
+        provider,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        has_tool_calls: tool_call_count > 0,
+        tool_call_count,
+        data_source: if has_api_data {
+            TokenDataSource::Api
+        } else {
+            TokenDataSource::Estimated
+        },
+        ..Default::default()
+    }
+}
+
 /// Estimate tokens from content length for agents that do not provide token data.
 #[must_use]
 pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedTokenUsage {
@@ -320,7 +377,8 @@ pub fn extract_tokens_for_agent(
     let extracted = match agent_slug {
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
-        "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" | "antigravity" => {
+        "antigravity" => extract_antigravity_tokens(extra),
+        "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))
@@ -598,5 +656,52 @@ mod tests {
         let usage = extract_tokens_for_agent("aider", &raw, "Some content here", "assistant");
         assert_eq!(usage.data_source, TokenDataSource::Estimated);
         assert!(usage.output_tokens.unwrap() > 0);
+    }
+
+    #[test]
+    fn extract_antigravity_tokens_reads_api_usage_model_and_tool_count() {
+        let raw: Value = serde_json::json!({
+            "model": "gemini-4-neon-xhigh",
+            "cass": {
+                "model": "gemini-4-neon-xhigh",
+                "tool_call_count": 2,
+                "token_usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 350,
+                    "cache_read_tokens": 800,
+                    "data_source": "api"
+                }
+            }
+        });
+
+        let usage = extract_tokens_for_agent("antigravity", &raw, "final answer", "assistant");
+        assert_eq!(usage.model_name.as_deref(), Some("gemini-4-neon-xhigh"));
+        assert_eq!(usage.provider.as_deref(), Some("google"));
+        assert_eq!(usage.input_tokens, Some(1200));
+        assert_eq!(usage.output_tokens, Some(350));
+        assert_eq!(usage.cache_read_tokens, Some(800));
+        assert_eq!(usage.total_tokens(), Some(2350));
+        assert!(usage.has_tool_calls);
+        assert_eq!(usage.tool_call_count, 2);
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+    }
+
+    #[test]
+    fn extract_antigravity_tokens_model_only_message_estimates_without_dropping_model() {
+        let raw: Value = serde_json::json!({
+            "model": "gemini-4-carbon-high"
+        });
+
+        let usage = extract_tokens_for_agent(
+            "antigravity",
+            &raw,
+            "Thinking through the plan",
+            "reasoning",
+        );
+        assert_eq!(usage.model_name.as_deref(), Some("gemini-4-carbon-high"));
+        assert_eq!(usage.provider.as_deref(), Some("google"));
+        assert_eq!(usage.data_source, TokenDataSource::Estimated);
+        assert!(usage.output_tokens.unwrap() > 0);
+        assert!(!usage.has_tool_calls);
     }
 }
