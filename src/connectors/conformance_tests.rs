@@ -804,8 +804,8 @@ mod conformance {
     mod storage_contract_conformance {
         use super::*;
         use crate::connectors::{
-            Connector, claude_code::ClaudeCodeConnector, codex::CodexConnector,
-            openclaw::OpenClawConnector,
+            Connector, antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
+            codex::CodexConnector, openclaw::OpenClawConnector,
         };
         use serde_json::Value;
         use std::path::Path;
@@ -1168,6 +1168,101 @@ mod conformance {
             let conversation = &conversations[0];
             assert_retained_user_marker(conversation);
             assert_drop_sentinels_absent(conversation, &[IMAGE_SENTINEL, CONTROL_SENTINEL]);
+            assert_storage_contract(conversation);
+        }
+
+        #[test]
+        fn antigravity_storage_contract_conformance() {
+            const HOOK_SENTINEL: &str = "AGY_PREINVOCATION_DROP_SENTINEL";
+            const REMINDER_SENTINEL: &str = "AGY_REMINDER_DROP_SENTINEL";
+
+            let tmp = TempDir::new().expect("create Antigravity fixture root");
+            let logs = tmp
+                .path()
+                .join("brain/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/.system_generated/logs");
+            fs::create_dir_all(&logs).expect("create Antigravity logs directory");
+            write_jsonl(
+                &logs.join("transcript_full.jsonl"),
+                &[
+                    json!({
+                        "step_index": 0,
+                        "source": "USER_EXPLICIT",
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-22T00:00:00Z",
+                        "content": format!("<USER_REQUEST>\n{USER_MARKER}\n</USER_REQUEST>")
+                    }),
+                    json!({
+                        "step_index": 1,
+                        "source": "SYSTEM_SDK",
+                        "type": "SYSTEM_MESSAGE",
+                        "created_at": "2026-11-22T00:00:01Z",
+                        "content": format!(
+                            "The following system message was injected by a PreInvocation hook:\n\
+                             <agent-contract-source id=\"global:USER.md\">{HOOK_SENTINEL}</agent-contract-source>"
+                        )
+                    }),
+                    json!({
+                        "step_index": 2,
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-22T00:00:02Z",
+                        "model": "gemini-4-neon-xhigh",
+                        "thinking": "Planning tool call",
+                        "content": "Antigravity answer",
+                        "tool_calls": [
+                            {"name": "read_file", "args": {"Path": "fixture.txt"}}
+                        ]
+                    }),
+                    json!({
+                        "step_index": 3,
+                        "source": "SYSTEM",
+                        "type": "SYSTEM_MESSAGE",
+                        "created_at": "2026-11-22T00:00:03Z",
+                        "content": format!(
+                            "<SYSTEM_MESSAGE>\nReminder: work efficiently. {REMINDER_SENTINEL}\n</SYSTEM_MESSAGE>"
+                        )
+                    }),
+                    json!({
+                        "step_index": 4,
+                        "source": "MODEL",
+                        "type": "GENERIC",
+                        "created_at": "2026-11-22T00:00:04Z",
+                        "content": "Created At: 2026-11-22T00:00:03Z\npaired Antigravity result"
+                    }),
+                    json!({
+                        "step_index": 5,
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-22T00:00:05Z",
+                        "model": "gemini-4-neon-xhigh",
+                        "tool_calls": [
+                            {"name": "read_file", "args": {"Path": "a.txt"}},
+                            {"name": "run_command", "args": {"CommandLine": "true"}}
+                        ]
+                    }),
+                    json!({
+                        "step_index": 6,
+                        "source": "MODEL",
+                        "type": "GENERIC",
+                        "created_at": "2026-11-22T00:00:06Z",
+                        "content": "Created At: 2026-11-22T00:00:06Z\nunpaired Antigravity result"
+                    }),
+                ],
+            );
+
+            let root = tmp.path().to_path_buf();
+            let ctx = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
+            let conversations = AntigravityConnector::new()
+                .scan(&ctx)
+                .expect("scan Antigravity synthetic fixture");
+            assert_eq!(
+                conversations.len(),
+                1,
+                "Antigravity fixture is one conversation"
+            );
+            let conversation = &conversations[0];
+            assert_retained_user_marker(conversation);
+            assert_drop_sentinels_absent(conversation, &[HOOK_SENTINEL, REMINDER_SENTINEL]);
             assert_storage_contract(conversation);
         }
     }
