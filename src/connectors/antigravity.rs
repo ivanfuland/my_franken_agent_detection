@@ -51,7 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -288,7 +288,10 @@ impl AntigravityConnector {
         let Ok(file) = File::open(transcript) else {
             return Vec::new();
         };
-        read_transcript_records_from_reader(BufReader::new(file), transcript)
+        read_transcript_records_from_reader(
+            BufReader::new(file.take(MAX_TRANSCRIPT_BYTES + 1)),
+            transcript,
+        )
     }
 }
 
@@ -1153,7 +1156,11 @@ fn emit_legacy_model_tool_step(
         .get("thinking")
         .and_then(Value::as_str)
         .is_some_and(|s| !s.trim().is_empty());
-    let fallback_name = step_type.to_ascii_lowercase();
+    let fallback_name = if step_type.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        step_type.trim().to_ascii_lowercase()
+    };
 
     if let Some(raw_calls) = rec
         .get("tool_calls")
